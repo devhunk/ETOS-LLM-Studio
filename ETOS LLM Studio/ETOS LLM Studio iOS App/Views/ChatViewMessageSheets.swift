@@ -16,10 +16,12 @@ struct MessageActionSheet: View {
     ]
 
     let payload: MessageActionSheetPayload
+    let isUserContentTruncated: Bool
     let hasDisplayVersions: Bool
     let displayVersionCount: Int
     let displayCurrentVersionIndex: Int
     let canRetry: Bool
+    let canPrefill: Bool
     let canRewrite: Bool
     let allMessages: [ChatMessage]
     let providers: [Provider]
@@ -27,6 +29,7 @@ struct MessageActionSheet: View {
     let onEdit: (ChatMessage) -> Void
     let onRewrite: (ChatMessage) -> Void
     let onRetry: (ChatMessage) -> Void
+    let onPrefill: (ChatMessage) -> Void
     let onShowFullError: (String) -> Void
     let onBranch: (ChatMessage) -> Void
     let onExport: (ChatTranscriptExportFormat, Bool, Bool, ChatMessage?) -> Void
@@ -51,6 +54,7 @@ struct MessageActionSheet: View {
     @State private var retryingVideoFileNames: Set<String> = []
     @State private var videoAnalysisErrorMessage: String?
     @State private var hasInlineMarkdownImages = false
+    @State private var inlineContents: [InlineHTMLContent] = []
 
     private var message: ChatMessage {
         payload.message
@@ -108,6 +112,16 @@ struct MessageActionSheet: View {
         NavigationStack {
             List {
                 Section {
+                    InlineHTMLMessageActionsLink(message: message, contents: inlineContents)
+
+                    if message.role == .user, isUserContentTruncated {
+                        NavigationLink {
+                            FullMessageContentView(content: message.content)
+                        } label: {
+                            Label(NSLocalizedString("查看完整内容", comment: ""), systemImage: "doc.text.magnifyingglass")
+                        }
+                    }
+
                     if !hasAttachments {
                         Button {
                             onEdit(message)
@@ -129,6 +143,13 @@ struct MessageActionSheet: View {
                             onRetry(message)
                         } label: {
                             Label(NSLocalizedString("重试", comment: ""), systemImage: "arrow.clockwise")
+                        }
+                        if canPrefill && message.canPrefill {
+                            Button {
+                                onPrefill(message)
+                            } label: {
+                                Label(NSLocalizedString("预填充续写", comment: ""), systemImage: "text.append")
+                            }
                         }
                     }
 
@@ -272,6 +293,7 @@ struct MessageActionSheet: View {
             Text(videoAnalysisErrorMessage ?? "")
         }
         .task(id: message.content) {
+            inlineContents = InlineHTMLContentRegistry.shared.contents(messageID: message.id, versionIndex: message.getCurrentVersionIndex())
             let content = message.content
             let containsImage = await Task.detached(priority: .utility) {
                 MarkdownImageReferenceSupport.hasDownloadableImage(in: content)
@@ -742,6 +764,7 @@ struct SessionPickerRow: View {
     let onExport: (ChatTranscriptExportFormat, Bool, Bool) -> Void
 
     @FocusState private var focused: Bool
+    @State private var showsUsageAnalytics = false
 
     var body: some View {
         SessionRowCard(isCurrent: isCurrent) {
@@ -749,6 +772,11 @@ struct SessionPickerRow: View {
         }
         .contextMenu {
             contextMenuContent
+        }
+        .sheet(isPresented: $showsUsageAnalytics) {
+            NavigationStack {
+                SessionUsageAnalyticsView(sessionID: session.id, sessionName: session.name)
+            }
         }
     }
 
@@ -795,6 +823,12 @@ struct SessionPickerRow: View {
 
     @ViewBuilder
     private var contextMenuContent: some View {
+        Button {
+            showsUsageAnalytics = true
+        } label: {
+            Label(NSLocalizedString("session_usage.title", value: "Conversation Analytics", comment: "会话分析统计入口"), systemImage: "chart.bar.xaxis")
+        }
+
         Button {
             onSelect()
         } label: {

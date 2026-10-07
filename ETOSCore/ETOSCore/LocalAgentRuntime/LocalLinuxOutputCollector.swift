@@ -26,10 +26,13 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    // 写入者先取得输出锁，再短暂取得屏幕锁；预览读取只取得屏幕锁，不等待磁盘 I/O。
+    private let presentationLock = NSLock()
     private let rawHandle: FileHandle
     private let modelHandle: FileHandle
     private let patterns: [RedactionPattern]
     private let privacyEnabled: Bool
+    private let maximumPatternBytes: Int
     private let modelByteLimit: UInt64
     private let terminalResponseHandler: (@Sendable (Data) -> Void)?
 
@@ -44,6 +47,7 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
     private var writeError: Error?
     private var isFinished = false
     private var userPreview = Data()
+    private var userPreviewNeedsRefresh = false
     private var lastUserPreviewStream: LocalLinuxOutputStream?
     private let userPreviewLimit = 262_144
     private var terminalScreen: LocalLinuxTerminalScreen?
@@ -55,6 +59,8 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
     private var terminalPreviewAppearance: LocalLinuxTerminalAppearance?
     private var terminalPreviewNeedsRefresh = false
     private var terminalDiagnosticSummaries: [String] = []
+    private let terminalChanges = LocalLinuxTerminalChanges()
+    private let diagnosticLineIDs = (0..<4).map { _ in UUID() }
 
     public init(
         rawURL: URL,
@@ -83,6 +89,7 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
             return RedactionPattern(value: Data(value.utf8), replacement: Data(replacement.utf8))
         }.sorted { $0.value.count > $1.value.count }
         self.privacyEnabled = privacyEnabled
+        maximumPatternBytes = privacyEnabled ? (patterns.first?.value.count ?? 0) : 0
         self.modelByteLimit = modelByteLimit
         self.terminalResponseHandler = terminalResponseHandler
         if let terminalColumns, let terminalRows {
@@ -133,21 +140,25 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !isFinished else { return }
+        presentationLock.lock()
         if terminalDiagnosticSummaries.last != summary {
             terminalDiagnosticSummaries.append(summary)
             terminalDiagnosticSummaries = Array(terminalDiagnosticSummaries.suffix(3))
         }
+        presentationLock.unlock()
         appendModelBytes(
             stream: .terminal,
             data: Data("\n\(summary)\n".utf8),
             flush: true
         )
+        terminalChanges.send()
     }
 
-    public func finish() {
+    public func finish(completeTerminalUpdates: Bool = true) {
         lock.lock()
         guard !isFinished else {
             lock.unlock()
+            if completeTerminalUpdates { terminalChanges.finish() }
             return
         }
         isFinished = true
@@ -177,6 +188,47 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
             writeError = writeError ?? error
         }
         lock.unlock()
+        if completeTerminalUpdates { terminalChanges.finish() }
+    }
+
+    /// 调度器先保存最终任务状态，再结束页面订阅，确保最后一帧与退出状态一致。
+    func finishTerminalUpdates() { terminalChanges.finish() }
+
+    func terminalDisplayUpdates(
+        appearance: LocalLinuxTerminalAppearance,
+        minimumInterval: Duration
+    ) -> AsyncStream<[LocalLinuxTerminalDisplayLine]> {
+        let changes = terminalChanges.stream()
+        let (stream, continuation) = AsyncStream<[LocalLinuxTerminalDisplayLine]>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        // 订阅持有收集器直到最后一帧发送完成；页面取消会同时取消这个任务。
+        let task = Task.detached(priority: .utility) { [self] in
+            for await _ in changes {
+                guard !Task.isCancelled else { break }
+                continuation.yield(self.terminalDisplayLines(appearance: appearance))
+                // 只在有输出后合并短时间内的变化；空闲时没有周期性唤醒。
+                do { try await Task<Never, Never>.sleep(for: minimumInterval) }
+                catch { break }
+            }
+            continuation.finish()
+        }
+        continuation.onTermination = { _ in task.cancel() }
+        return stream
+    }
+
+    func terminalDisplayLines(appearance: LocalLinuxTerminalAppearance) -> [LocalLinuxTerminalDisplayLine] {
+        presentationLock.lock()
+        defer { presentationLock.unlock() }
+        var lines = terminalScreen?.renderedDisplayLines(appearance: appearance) ?? []
+        if !terminalDiagnosticSummaries.isEmpty {
+            for (index, summary) in (terminalDiagnosticSummaries + [LocalLinuxDiagnosticPresentation.userGuidance]).enumerated() {
+                lines.append(LocalLinuxTerminalDisplayLine(
+                    id: diagnosticLineIDs[index], plainText: summary, attributedText: AttributedString(summary)
+                ))
+            }
+        }
+        return lines
     }
 
     public func snapshot() -> LocalLinuxOutputSnapshot {
@@ -194,16 +246,27 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
     }
 
     public func userVisiblePreview() -> String {
-        lock.lock()
-        defer { lock.unlock() }
+        presentationLock.lock()
+        defer { presentationLock.unlock() }
+        refreshUserPreviewIfNeeded()
         return String(decoding: userPreview, as: UTF8.self)
+    }
+
+    private func refreshUserPreviewIfNeeded() {
+        if userPreviewNeedsRefresh, let terminalScreen {
+            userPreview = Data(terminalScreen.renderedText().utf8)
+            if userPreview.count > userPreviewLimit {
+                userPreview.removeFirst(userPreview.count - userPreviewLimit)
+            }
+            userPreviewNeedsRefresh = false
+        }
     }
 
     public func userVisibleTerminalPresentation(
         appearance: LocalLinuxTerminalAppearance = .dark
     ) -> LocalLinuxTerminalPresentation? {
-        lock.lock()
-        defer { lock.unlock() }
+        presentationLock.lock()
+        defer { presentationLock.unlock() }
         if terminalPresentationNeedsRefresh
             || terminalPresentationAppearance != appearance,
            let terminalScreen {
@@ -219,8 +282,8 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
         maximumLines: Int,
         appearance: LocalLinuxTerminalAppearance = .dark
     ) -> LocalLinuxTerminalPresentation? {
-        lock.lock()
-        defer { lock.unlock() }
+        presentationLock.lock()
+        defer { presentationLock.unlock() }
         let normalizedMaximumLines = max(1, maximumLines)
         if terminalPreviewNeedsRefresh
             || terminalPreviewMaximumLines != normalizedMaximumLines
@@ -238,10 +301,10 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
     }
 
     public func resizeTerminalPreview(columns: Int, rows: Int) {
-        lock.lock()
-        defer { lock.unlock() }
+        presentationLock.lock()
+        defer { presentationLock.unlock() }
         terminalScreen?.resize(columns: columns, rows: rows)
-        replaceUserPreviewWithTerminalSnapshot()
+        invalidateTerminalPresentations()
     }
 
     private func writeRawFrame(stream: LocalLinuxOutputStream, data: Data) throws {
@@ -252,21 +315,25 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
         case .terminal: marker = 3
         }
         var length = UInt32(data.count).bigEndian
-        var header = Data([marker])
-        withUnsafeBytes(of: &length) { header.append(contentsOf: $0) }
-        try rawHandle.write(contentsOf: header)
-        try rawHandle.write(contentsOf: data)
+        var frame = Data(capacity: 5 + data.count)
+        frame.append(marker)
+        withUnsafeBytes(of: &length) { frame.append(contentsOf: $0) }
+        frame.append(data)
+        try rawHandle.write(contentsOf: frame)
     }
 
     private func appendUserPreview(stream: LocalLinuxOutputStream, data: Data) {
+        presentationLock.lock()
+        defer { presentationLock.unlock() }
         if stream == .terminal, let terminalScreen {
             terminalScreen.append(data)
-            replaceUserPreviewWithTerminalSnapshot()
+            invalidateTerminalPresentations()
             let responses = terminalScreen.drainResponses()
             if !responses.isEmpty { terminalResponseHandler?(responses) }
             lastUserPreviewStream = stream
             return
         }
+        refreshUserPreviewIfNeeded()
         if stream != .terminal, lastUserPreviewStream != stream {
             let label = stream == .stdout ? "\n[stdout]\n" : "\n[stderr]\n"
             userPreview.append(contentsOf: label.utf8)
@@ -278,14 +345,13 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
         }
     }
 
-    private func replaceUserPreviewWithTerminalSnapshot() {
-        guard let terminalScreen else { return }
+    private func invalidateTerminalPresentations() {
+        // 协议解析和回包必须持续进行；完整历史的拼接只在读取预览时执行，
+        // 避免隐藏终端的每个输出分片都重复复制最多 2,000 行文本。
+        userPreviewNeedsRefresh = true
         terminalPresentationNeedsRefresh = true
         terminalPreviewNeedsRefresh = true
-        userPreview = Data(terminalScreen.renderedText().utf8)
-        if userPreview.count > userPreviewLimit {
-            userPreview.removeFirst(userPreview.count - userPreviewLimit)
-        }
+        terminalChanges.send()
     }
 
     private func presentationWithDiagnostics(
@@ -305,9 +371,16 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
     }
 
     private func appendModelBytes(stream: LocalLinuxOutputStream, data: Data, flush: Bool) {
+        // 模型副本满额后不再扫描或保留跨分片尾部；原始输出和终端协议仍照常处理。
+        guard modelBytes < modelByteLimit else {
+            if !data.isEmpty || pendingByStream.values.contains(where: { !$0.isEmpty }) {
+                didTruncate = true
+            }
+            pendingByStream.removeAll(keepingCapacity: true)
+            return
+        }
         var combined = pendingByStream[stream, default: Data()]
         combined.append(data)
-        let maximumPatternBytes = privacyEnabled ? patterns.map(\.value.count).max() ?? 0 : 0
         var cutoff = flush || maximumPatternBytes == 0
             ? combined.count
             : max(0, combined.count - maximumPatternBytes + 1)
@@ -333,7 +406,12 @@ public final class LocalLinuxOutputCollector: @unchecked Sendable {
                 try writeModel(Data(label.utf8))
                 lastModelStream = stream
             }
-            try writeModel(redacted(ready))
+            if modelBytes < modelByteLimit {
+                try writeModel(redacted(ready))
+            } else {
+                // stream 标签本身也计入预算，可能已经占满最后的可用字节。
+                didTruncate = true
+            }
         } catch {
             writeError = writeError ?? error
         }

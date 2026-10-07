@@ -7,6 +7,7 @@
 // ============================================================================
 
 import Foundation
+import Combine
 import WatchKit
 import ETOSCore
 #if canImport(UserNotifications)
@@ -25,81 +26,59 @@ extension ChatViewModel {
         }
         isSendingMessage = runningSessionIDs.contains(currentSessionID)
         if isSendingMessage {
-            pendingSendSubmissionSessionIDs.remove(currentSessionID)
+            sendSubmissionState.requestDidStart(for: currentSessionID)
         }
         if wasSendingMessage, !isSendingMessage {
             finalizeStreamingMarkdownIfNeeded()
         }
     }
 
-    func prepareBackgroundReplyNotificationContext(for sessionID: UUID) {
-        let messages = sessionID == currentSession?.id
-            ? allMessagesForSession
-            : Persistence.loadMessages(for: sessionID)
-        let baseline = latestAssistantReplyMarker(from: messages)
+    func prepareBackgroundReplyNotificationContext(for sessionID: UUID, messages: [ChatMessage]) {
         pendingReplyNotificationContextBySessionID[sessionID] = PendingBackgroundReplyNotificationContext(
-            baselineMarker: baseline,
+            baselineMessages: messages,
             sessionName: notificationSessionName(for: sessionID)
         )
     }
 
-    func notifyIfAssistantReplyFinishedInBackground(for sessionID: UUID) {
-#if canImport(UserNotifications)
-        enforceBackgroundReplyNotificationEnabled()
-#else
-        return
-#endif
-        guard isApplicationInBackground else {
-            pendingReplyNotificationContextBySessionID.removeValue(forKey: sessionID)
-            return
-        }
-        guard let context = pendingReplyNotificationContextBySessionID.removeValue(forKey: sessionID) else { return }
-
-        let messages = sessionID == currentSession?.id
-            ? allMessagesForSession
-            : Persistence.loadMessages(for: sessionID)
-        guard let latestMarker = latestAssistantReplyMarker(from: messages) else { return }
-        guard latestMarker != context.baselineMarker else { return }
-        guard latestMarker != lastNotifiedAssistantMarker else { return }
-        lastNotifiedAssistantMarker = latestMarker
-
-        let snippet = notificationSnippet(for: latestMarker)
-#if canImport(UserNotifications)
-        Task {
-            guard await requestBackgroundReplyNotificationAuthorizationIfNeeded() else { return }
-            await postBackgroundReplyLocalNotification(
-                sessionID: sessionID,
-                sessionName: context.sessionName,
-                snippet: snippet,
-                messageID: latestMarker.id
-            )
-        }
-#endif
+    func notifyIfAssistantReplyFinishedInBackground(for sessionID: UUID, messages: [ChatMessage]) {
+        scheduleBackgroundReplyNotificationIfNeeded(for: sessionID, messages: messages)
     }
 
-    func notifyIfAssistantReplyFinishedFromOffscreenSession(_ sessionID: UUID) {
+    func notifyIfAssistantReplyFinishedFromOffscreenSession(_ sessionID: UUID, messages: [ChatMessage]) {
+        scheduleBackgroundReplyNotificationIfNeeded(for: sessionID, messages: messages)
+    }
+
+    private func scheduleBackgroundReplyNotificationIfNeeded(for sessionID: UUID, messages: [ChatMessage]) {
+        defer { refreshBackgroundGenerationState() }
+        guard let context = pendingReplyNotificationContextBySessionID.removeValue(forKey: sessionID) else { return }
 #if canImport(UserNotifications)
         enforceBackgroundReplyNotificationEnabled()
-#else
-        return
-#endif
-        guard let context = pendingReplyNotificationContextBySessionID.removeValue(forKey: sessionID) else { return }
-        let messages = Persistence.loadMessages(for: sessionID)
-        guard let latestMarker = latestAssistantReplyMarker(from: messages) else { return }
-        guard latestMarker != context.baselineMarker else { return }
-        guard latestMarker != lastNotifiedAssistantMarker else { return }
-        lastNotifiedAssistantMarker = latestMarker
-
-        let snippet = notificationSnippet(for: latestMarker)
-#if canImport(UserNotifications)
-        Task {
-            guard await requestBackgroundReplyNotificationAuthorizationIfNeeded() else { return }
-            await postBackgroundReplyLocalNotification(
+        let action = replyNotificationAction(for: sessionID)
+        guard action != .suppress else { return }
+        pendingReplyNotificationDeliveryCount += 1
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                pendingReplyNotificationDeliveryCount -= 1
+                refreshBackgroundGenerationState()
+            }
+            if action == .resolveTransition {
+                try? await Task.sleep(for: .milliseconds(350))
+            }
+            guard replyNotificationAction(for: sessionID) == .deliver else { return }
+            let baselineMessages = context.baselineMessages
+            let (baseline, latestMarker) = await Task.detached(priority: .utility) {
+                (Self.latestAssistantReplyMarker(from: baselineMessages), Self.latestAssistantReplyMarker(from: messages))
+            }.value
+            guard replyNotificationAction(for: sessionID) == .deliver else { return }
+            guard let latestMarker, latestMarker != baseline, latestMarker != lastNotifiedAssistantMarker else { return }
+            let delivered = await AppLocalNotificationCenter.shared.postChatReplyFinishedNotification(
                 sessionID: sessionID,
                 sessionName: context.sessionName,
-                snippet: snippet,
+                snippet: notificationSnippet(for: latestMarker),
                 messageID: latestMarker.id
             )
+            if delivered { lastNotifiedAssistantMarker = latestMarker }
         }
 #endif
     }
@@ -111,11 +90,24 @@ extension ChatViewModel {
         return chatSessions.first(where: { $0.id == sessionID })?.name
     }
 
-    private var isApplicationInBackground: Bool {
-        WKExtension.shared().applicationState != .active
+    private var applicationVisibility: BackgroundReplyNotificationPolicy.ApplicationVisibility {
+        switch WKApplication.shared().applicationState {
+        case .active: return .active
+        case .inactive: return .inactive
+        case .background: return .background
+        @unknown default: return .inactive
+        }
     }
 
-    private func latestAssistantReplyMarker(from messages: [ChatMessage]) -> AssistantReplyMarker? {
+    private func replyNotificationAction(for sessionID: UUID) -> BackgroundReplyNotificationPolicy.Action {
+        // 会话切换也在异步发布，使用服务的当前会话，避免拿滞后的界面状态抑制通知。
+        BackgroundReplyNotificationPolicy.action(
+            for: applicationVisibility,
+            isCurrentSession: chatService.currentSessionSubject.value?.id == sessionID
+        )
+    }
+
+    nonisolated static func latestAssistantReplyMarker(from messages: [ChatMessage]) -> AssistantReplyMarker? {
         for message in ChatResponseAttemptSupport.visibleMessages(from: messages).reversed() where message.role == .assistant {
             let normalizedText = normalizedNotificationText(message.content)
             let imageCount = message.imageFileNames?.count ?? 0
@@ -152,15 +144,16 @@ extension ChatViewModel {
         return NSLocalizedString("你收到了新的回复。", comment: "Background reply notification fallback for generic response")
     }
 
-    private func normalizedNotificationText(_ text: String) -> String {
+    private nonisolated static func normalizedNotificationText(_ text: String) -> String {
         text
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func truncatedText(_ text: String, maxLength: Int) -> String {
-        guard text.count > maxLength else { return text }
-        return String(text.prefix(maxLength - 1)) + "…"
+        let prefix = String(text.prefix(maxLength + 1))
+        guard prefix.count > maxLength else { return text }
+        return String(prefix.prefix(maxLength - 1)) + "…"
     }
 
     func autoPlayLatestAssistantMessageIfNeeded() {
@@ -174,7 +167,6 @@ extension ChatViewModel {
             isCurrentlySpeaking: ttsManager.isSpeaking
         ), let latest else { return }
         lastAutoPlayedAssistantMessageID = latest.id
-        ttsManager.updateSelectedModel(selectedTTSModel)
         ttsManager.speak(latest.content, messageID: latest.id, flush: true)
     }
 
@@ -210,18 +202,21 @@ extension ChatViewModel {
         return currentInput + "\n" + normalizedCodeBlockContent
     }
 
-#if canImport(UserNotifications)
-    private func postBackgroundReplyLocalNotification(sessionID: UUID, sessionName: String?, snippet: String, messageID: UUID) async {
-        _ = await AppLocalNotificationCenter.shared.postChatReplyFinishedNotification(
-            sessionID: sessionID,
-            sessionName: sessionName,
-            snippet: snippet,
-            messageID: messageID
-        )
+    func refreshBackgroundGenerationState() {
+        // 运行集合先释放停止按钮；等通知提交后再结束扩展会话和后台保活。
+        let active = !runningSessionIDs.isEmpty || !pendingReplyNotificationContextBySessionID.isEmpty
+            || pendingReplyNotificationDeliveryCount > 0
+        if active {
+            startExtendedSession()
+        } else {
+            stopExtendedSession()
+        }
+        WatchBackgroundGenerationKeepAliveManager.shared.setGenerationActive(active)
+        BackgroundGenerationAudioKeepAliveManager.shared.setGenerationActive(active)
     }
-#endif
 
     func startExtendedSession() {
+        if let extendedSession, extendedSession.state != .invalid { return }
         extendedSession = WKExtendedRuntimeSession()
         extendedSession?.start()
     }

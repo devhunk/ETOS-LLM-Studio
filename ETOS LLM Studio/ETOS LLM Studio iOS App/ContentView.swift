@@ -17,8 +17,15 @@ import UIKit
 import CoreText
 #endif
 
+enum GuideOverlayPresentationPolicy {
+    static func shouldPresent(isEnabled: Bool, activeMode: GuideMode?) -> Bool {
+        isEnabled && activeMode == .contextualHelp
+    }
+}
+
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.sizeCategory) private var sizeCategory
     @EnvironmentObject private var viewModel: ChatViewModel
     @StateObject private var announcementManager = AnnouncementManager.shared
     @StateObject private var surveyManager = SurveyManager.shared
@@ -27,12 +34,15 @@ struct ContentView: View {
     @ObservedObject private var appConfig = AppConfigStore.shared
     @ObservedObject private var appLockManager = AppLockManager.shared
     @ObservedObject private var toolPermissionCenter = ToolPermissionCenter.shared
+    @ObservedObject private var guideCoordinator = GuideContextCoordinator.shared
+    @StateObject private var guideController = GuideConversationController(historyStore: .contextualHelp)
     @State private var settingsDestination: SettingsNavigationDestination?
     @State private var dailyPulsePreparationTask: Task<Void, Never>?
     @State private var launchRecoveryNoticeMessage: String?
     @State private var launchRecoveryRequest: Persistence.LaunchRecoveryRequest?
     @State private var launchRecoveryErrorMessage: String?
     @State private var rootBodyFont: Font = .body
+    @State private var rootFontPreparationTask: Task<Void, Never>?
     @State private var legacyMigrationErrorMessage: String?
     @State private var isLegacyMigrationErrorPresented: Bool = false
     @State private var isNativeSettingsPresented: Bool = false
@@ -42,21 +52,32 @@ struct ContentView: View {
     @State private var newAPIProviderImportNoticeMessage: String?
     @State private var newAPIProviderImportErrorMessage: String?
     @State private var didEnterBackgroundSinceLastActivation = false
+    @State private var settingsGuideContextToken: GuideContextCoordinator.RegistrationToken?
     
     var body: some View {
         contentWithMigrationOverlays
+            .localLinuxDiagnosticFeedback(
+                blocked: rootToolPermissionAutoPresentationBlocked
+                    || toolPermissionCenter.activeRequest != nil
+                    || toolPermissionCenter.hasAutoPresentationBlockers(excluding: ["ios.root.presentation"])
+            )
             // 启动时检查公告
             .task {
                 await handleLaunchTasks()
             }
             .onAppear {
                 refreshRootToolPermissionAutoPresentationBlocker()
+                updateSettingsGuideContext(isPresented: isNativeSettingsPresented)
             }
             .onDisappear {
                 setRootToolPermissionAutoPresentationBlocked(false)
+                updateSettingsGuideContext(isPresented: false)
             }
             .onChange(of: rootToolPermissionAutoPresentationBlocked) { _, _ in
                 refreshRootToolPermissionAutoPresentationBlocker()
+            }
+            .onChange(of: isNativeSettingsPresented) { _, isPresented in
+                updateSettingsGuideContext(isPresented: isPresented)
             }
             .onChange(of: announcementManager.shouldShowAlert) { _, isPresented in
                 guard !isPresented else { return }
@@ -79,6 +100,10 @@ struct ContentView: View {
                     }
                     scheduleDailyPulsePreparation(after: 1_500_000_000)
                 case .background:
+                    Task {
+                        await guideController.persistHistory()
+                        await GuideConversationController.modelSetup.persistHistory()
+                    }
                     LocalLinuxBackgroundTaskManager.shared.sceneDidEnterBackground()
                     TTSManager.shared.setApplicationIsInBackground(true)
                     appLockManager.handleSceneDidEnterBackground()
@@ -202,6 +227,9 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .requestOpenUpdateTimeline)) { _ in
             openUpdateTimelineFromNotification()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .requestGuideModelManagement)) { _ in
+            pushNativeSettings(destination: .modelManagement)
+        }
         .onReceive(
             NotificationCenter.default.publisher(for: .requestIncomingSnapshotRestore),
             perform: handleIncomingSnapshotRestore
@@ -222,6 +250,9 @@ struct ContentView: View {
     private var fontAndLanguageAwareContent: some View {
         appNavigationContent
             .environment(\.font, rootBodyFont)
+            .onChange(of: sizeCategory) { _, _ in
+                refreshRootBodyFont()
+            }
             .environment(\.locale, AppLanguagePreference.preferredLocale(rawValue: appConfig.appLanguage))
             .onAppear {
                 AppLanguageRuntime.apply(rawValue: appConfig.appLanguage)
@@ -264,6 +295,16 @@ struct ContentView: View {
                 .navigationDestination(isPresented: $isNativeSettingsPresented) {
                     SettingsView(requestedDestination: $settingsDestination)
                 }
+        }
+        .overlay {
+            if GuideOverlayPresentationPolicy.shouldPresent(
+                isEnabled: appConfig.guideOverlayEnabled,
+                activeMode: guideCoordinator.activePage?.mode
+            ) {
+                GuideFloatingOverlay(controller: guideController)
+                    .environmentObject(viewModel)
+                    .zIndex(100)
+            }
         }
     }
 
@@ -611,6 +652,43 @@ struct ContentView: View {
         isNativeSettingsPresented = false
     }
 
+    private func updateSettingsGuideContext(isPresented: Bool) {
+        guard isPresented else {
+            if let settingsGuideContextToken {
+                guideCoordinator.unregister(settingsGuideContextToken)
+                self.settingsGuideContextToken = nil
+            }
+            return
+        }
+        guard settingsGuideContextToken == nil else { return }
+
+        let settingsViewModel = viewModel
+        settingsGuideContextToken = guideCoordinator.register(
+            descriptor: GuidePageDescriptor(
+                id: "settings-navigation",
+                title: NSLocalizedString("设置", comment: "设置导航向导后备上下文标题"),
+                documents: [GuideDocumentReference(id: "guide-overview", title: "Guide Overview")]
+            ),
+            isFallback: true,
+            snapshot: {
+                GuidePageSnapshot(fields: [
+                    "provider_count": GuideSnapshotField(
+                        label: NSLocalizedString("提供商数量", comment: "设置导航向导后备快照字段"),
+                        value: .int(settingsViewModel.providers.count),
+                        access: .readOnly
+                    ),
+                    "selected_model": GuideSnapshotField(
+                        label: NSLocalizedString("当前模型", comment: "设置导航向导后备快照字段"),
+                        value: .string(settingsViewModel.selectedModel?.model.displayName ?? ""),
+                        access: .readOnly
+                    )
+                ])
+            },
+            buildProposal: { _, _ in throw GuideError.invalidToolArguments },
+            execute: { _ in throw GuideError.invalidToolArguments }
+        )
+    }
+
     private func scheduleDailyPulsePreparation(after delayNanoseconds: UInt64) {
         dailyPulsePreparationTask?.cancel()
         dailyPulsePreparationTask = Task(priority: .utility) {
@@ -636,10 +714,13 @@ struct ContentView: View {
     }
 
     private func refreshRootBodyFont() {
-        rootBodyFont = AppFontAdapter.adaptedFont(
-            from: .body,
-            sampleText: "The quick brown fox 你好こんにちは"
-        )
+        rootFontPreparationTask?.cancel()
+        rootFontPreparationTask = Task { @MainActor in
+            let font = await ETFontResolver.shared.font(for: .body, sizeCategory: sizeCategory)
+            guard !Task.isCancelled else { return }
+            rootBodyFont = font
+            rootFontPreparationTask = nil
+        }
     }
 
     private var legacyJSONMigrationPromptSheet: some View {

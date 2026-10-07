@@ -1,0 +1,235 @@
+import Foundation
+
+public struct ChatRequestRetryStatus: Hashable, Sendable {
+    public enum Kind: Hashable, Sendable {
+        case automatic
+        case apiKey
+    }
+
+    public let kind: Kind
+    public let attempt: Int
+    public let maximumAttempts: Int
+    /// 仅退避等待期间有值，请求发出后不再显示倒计时。
+    public let remainingSeconds: Int?
+
+    init(attempt: Int, maximumAttempts: Int, remainingSeconds: Int? = nil, kind: Kind = .automatic) {
+        self.kind = kind
+        self.attempt = attempt
+        self.maximumAttempts = maximumAttempts
+        self.remainingSeconds = remainingSeconds
+    }
+
+    public var thinkingText: String {
+        if kind == .apiKey {
+            return String(format: NSLocalizedString("正在思考·切换 Key(%d/%d)", comment: ""), attempt, maximumAttempts)
+        }
+        if let remainingSeconds {
+            return String(
+                format: NSLocalizedString("正在思考·重试(%d/%d)·%ds", comment: ""),
+                attempt, maximumAttempts, remainingSeconds
+            )
+        }
+        return String(format: NSLocalizedString("正在思考·重试(%d/%d)", comment: ""), attempt, maximumAttempts)
+    }
+}
+
+public enum ChatRequestRetryPolicy {
+    public static let defaultMaximumRetries = 3
+    public static let allowedMaximumRetries = 0...10
+
+    static func maximumRetries(from text: String) -> Int? {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.utf8.allSatisfy({ (48...57).contains($0) }),
+              let count = Int(text), allowedMaximumRetries.contains(count) else { return nil }
+        return count
+    }
+
+    static func delay(forRetry retry: Int) -> TimeInterval {
+        min(30, pow(2, Double(max(0, min(retry - 1, 5)))))
+    }
+
+    static func isRetryable(_ error: Error, smartDetectionEnabled: Bool = true) -> Bool {
+        // 用户主动停止或拒绝连接仍然结束请求，不受错误筛选开关影响。
+        guard !(error is CancellationError), !NetworkConnectionSecurityError.isRejection(error) else { return false }
+        guard smartDetectionEnabled else { return true }
+        if case ChatService.NetworkError.badStatusCode(let code, _) = error {
+            return [408, 429, 500, 502, 503, 504, 529].contains(code)
+        }
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else { return false }
+        return [URLError.timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+                .networkConnectionLost, .notConnectedToInternet].contains { $0.rawValue == nsError.code }
+    }
+}
+
+extension ChatService {
+    /// 只重放当前模型请求；已完成的工具调用和附件预处理不会再次执行。
+    func withAutomaticRequestRetries(
+        request: URLRequest,
+        provider: Provider,
+        apiFormat: String,
+        loadingMessageID: UUID,
+        sessionID: UUID,
+        requestLogContext: RequestLogContext,
+        initialPrefill: ChatMessage?,
+        rebuildRequest: (ChatMessage) -> URLRequest?,
+        prepareKeyRetryRequest: (URLRequest) async throws -> URLRequest = { $0 },
+        operation: (URLRequest, UUID, RequestLogContext, @escaping (Error) async -> Bool) async -> Void
+    ) async {
+        let (configuredMaximum, smartDetectionEnabled) = await MainActor.run {
+            (AppConfigStore.shared.maximumRequestRetries, AppConfigStore.shared.requestRetrySmartDetectionEnabled)
+        }
+        let maximumRetries = min(10, max(0, configuredMaximum))
+        let maximumKeyRetries = ProviderAPIKeyRetryPolicy.maximumRetries(for: provider)
+        var retryCount = 0
+        var keyRetryCount = 0
+        var currentRequest = request
+        var currentLoadingID = loadingMessageID
+        var currentLogContext = requestLogContext
+        var prefix = initialPrefill?.content ?? ""
+
+        defer { setRequestRetryStatus(nil, messageID: currentLoadingID, sessionID: sessionID) }
+        while !Task.isCancelled {
+            var failure: Error?
+            var retryKind: ChatRequestRetryStatus.Kind = .automatic
+            RequestTransactionLogRegistry.bindRequest(
+                currentRequest, requestID: currentLogContext.requestID,
+                requestedAt: currentLogContext.requestedAt, providerName: currentLogContext.providerName,
+                modelID: currentLogContext.modelID, isStreaming: currentLogContext.isStreaming
+            )
+            await operation(currentRequest, currentLoadingID, currentLogContext) { error in
+                guard !Task.isCancelled else { return false }
+                let message = self.messagesSnapshot(for: sessionID).first { $0.id == currentLoadingID }
+                let hasGeneratedMedia = !(message?.imageFileNames ?? []).isEmpty || message?.audioFileName != nil
+                if keyRetryCount < maximumKeyRetries, !hasGeneratedMedia,
+                   ProviderAPIKeyRetryPolicy.isRetryable(error) {
+                    retryKind = .apiKey
+                    failure = error
+                    return true
+                }
+                guard retryCount < maximumRetries,
+                      ChatRequestRetryPolicy.isRetryable(error, smartDetectionEnabled: smartDetectionEnabled),
+                      !smartDetectionEnabled || !hasGeneratedMedia else { return false }
+                retryKind = .automatic
+                failure = error
+                return true
+            }
+            guard let failure else { return }
+            await finalizeInterruptedReasoningMessageIfNeeded(loadingMessageID: currentLoadingID, in: sessionID)
+            _ = await persistAndPublishStreamingMessages(
+                messagesSnapshot(for: sessionID), loadingMessageID: currentLoadingID, sessionID: sessionID
+            )
+            let partial = messagesSnapshot(for: sessionID).first { $0.id == currentLoadingID }
+            let hasGeneratedMedia = !(partial?.imageFileNames ?? []).isEmpty || partial?.audioFileName != nil
+            let statusCode: Int?
+            if case NetworkError.badStatusCode(let code, _) = failure { statusCode = code } else { statusCode = nil }
+            persistRequestLog(
+                context: currentLogContext, status: .failed, tokenUsage: partial?.tokenUsage,
+                finishedAt: Date(), httpStatusCode: statusCode,
+                errorKind: retryKind == .apiKey ? "api_key_retry" : "automatic_retry"
+            )
+
+            if retryKind == .apiKey {
+                keyRetryCount += 1
+            } else {
+                retryCount += 1
+                // 全局自动重试开始新一轮请求，换 Key 的预算重新计数，两个上限互不覆盖。
+                keyRetryCount = 0
+            }
+            do {
+                // 使用同一单调时钟计算等待和显示，挂起恢复后不会补跑过期倒计时。
+                // 更新只存在于当前请求的退避期间，取消请求会同时结束等待。
+                let clock = ContinuousClock()
+                let delay = retryKind == .automatic ? ChatRequestRetryPolicy.delay(forRetry: retryCount) : 0
+                let deadline = clock.now.advanced(by: .seconds(delay))
+                while clock.now < deadline {
+                    try Task.checkCancellation()
+                    let remaining = clock.now.duration(to: deadline).components
+                    let seconds = Int(remaining.seconds) + (remaining.attoseconds > 0 ? 1 : 0)
+                    guard seconds > 0 else { break }
+                    setRequestRetryStatus(
+                        ChatRequestRetryStatus(
+                            attempt: retryCount, maximumAttempts: maximumRetries, remainingSeconds: seconds
+                        ),
+                        messageID: currentLoadingID, sessionID: sessionID
+                    )
+                    try await clock.sleep(until: min(deadline, clock.now.advanced(by: .seconds(1))))
+                }
+                try Task.checkCancellation()
+            } catch { return }
+
+            if let partial, hasGeneratedMedia || (!partial.content.isEmpty && partial.content != prefix) {
+                // 流式工具参数可能只收到一半；保留在旧版本中，不作为已完成调用重放。
+                var retryTarget = hasGeneratedMedia ? partial : ChatMessage(id: partial.id, role: .assistant, content: partial.content)
+                retryTarget.reasoningContent = partial.reasoningContent
+                retryTarget.toolCalls = nil
+                setRequestRetryStatus(nil, messageID: currentLoadingID, sessionID: sessionID)
+                guard let retry = prepareMessageRetry(
+                    targetMessage: retryTarget, in: messagesSnapshot(for: sessionID),
+                    prefill: !hasGeneratedMedia, restartingCurrentRequest: hasGeneratedMedia
+                ), let rebuilt = hasGeneratedMedia ? currentRequest : rebuildRequest(retryTarget) else {
+                    addErrorMessage(NSLocalizedString("错误: 无法构建 API 请求。", comment: ""), sessionID: sessionID)
+                    emitSessionRequestStatus(.error, sessionID: sessionID)
+                    return
+                }
+                persistAndPublishMessages(retry.storedMessages, for: sessionID)
+                currentLoadingID = retry.loadingMessage.id
+                updateRequestLoadingMessageID(currentLoadingID, for: sessionID)
+                currentRequest = provider.preservingAuthentication(from: currentRequest, in: rebuilt)
+                // 图片和音频无法拼接为文本前缀；保留中断版本，重新执行当前请求。
+                if !hasGeneratedMedia { prefix = retryTarget.content }
+            }
+
+            if retryKind == .apiKey {
+                currentRequest = provider.rotatingAPIKey(in: currentRequest, apiFormat: apiFormat)
+                do {
+                    currentRequest = try await prepareKeyRetryRequest(currentRequest)
+                } catch {
+                    guard !Task.isCancelled, !(error is CancellationError) else { return }
+                    addErrorMessage(error.localizedDescription, sessionID: sessionID)
+                    emitSessionRequestStatus(.error, sessionID: sessionID)
+                    return
+                }
+            }
+            resetPartialResponseForRetry(messageID: currentLoadingID, sessionID: sessionID, prefix: prefix)
+            setRequestRetryStatus(
+                ChatRequestRetryStatus(
+                    attempt: retryKind == .apiKey ? keyRetryCount : retryCount,
+                    maximumAttempts: retryKind == .apiKey ? maximumKeyRetries : maximumRetries,
+                    kind: retryKind
+                ),
+                messageID: currentLoadingID, sessionID: sessionID
+            )
+            currentLogContext = RequestLogContext(
+                requestID: UUID(), sessionID: requestLogContext.sessionID,
+                providerID: requestLogContext.providerID, providerName: requestLogContext.providerName,
+                modelID: requestLogContext.modelID, requestSource: requestLogContext.requestSource,
+                isStreaming: requestLogContext.isStreaming, requestedAt: Date(),
+                modelReference: requestLogContext.modelReference, modelPricing: requestLogContext.modelPricing
+            )
+        }
+    }
+
+    func setRequestRetryStatus(_ status: ChatRequestRetryStatus?, messageID: UUID, sessionID: UUID) {
+        var messages = messagesSnapshot(for: sessionID)
+        guard let index = messages.firstIndex(where: { $0.id == messageID }),
+              messages[index].requestRetryStatus != status else { return }
+        messages[index].requestRetryStatus = status
+        _ = publishStreamingMessages(messages, loadingMessageID: messageID, sessionID: sessionID)
+    }
+
+    private func resetPartialResponseForRetry(messageID: UUID, sessionID: UUID, prefix: String) {
+        var messages = messagesSnapshot(for: sessionID)
+        guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
+        messages[index].content = prefix
+        if prefix.isEmpty { messages[index].reasoningContent = nil }
+        messages[index].toolCalls = nil
+        messages[index].toolCallsPlacement = nil
+        messages[index].reasoningProviderSpecificFields = nil
+        messages[index].providerResponseMetadata = nil
+        messages[index].responseMetrics = nil
+        messages[index].tokenUsage = nil
+        messages[index].costEstimate = nil
+        _ = publishStreamingMessages(messages, loadingMessageID: messageID, sessionID: sessionID)
+    }
+}

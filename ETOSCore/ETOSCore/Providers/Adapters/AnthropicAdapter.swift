@@ -61,6 +61,12 @@ public class AnthropicAdapter: APIAdapter {
             let output_tokens: Int?
             let cache_creation_input_tokens: Int?
             let cache_read_input_tokens: Int?
+            let cache_creation: CacheCreation?
+
+            struct CacheCreation: Decodable {
+                let ephemeral_5m_input_tokens: Int?
+                let ephemeral_1h_input_tokens: Int?
+            }
         }
         
         struct Error: Decodable {
@@ -171,6 +177,7 @@ public class AnthropicAdapter: APIAdapter {
     
     public func buildChatRequest(for model: RunnableModel, commonPayload: [String: Any], messages: [ChatMessage], tools: [InternalToolDefinition]?, audioAttachments: [UUID: AudioAttachment], imageAttachments: [UUID: [ImageAttachment]], fileAttachments: [UUID: [FileAttachment]]) -> URLRequest? {
         let reasoningContentEchoMode = resolvedReasoningContentEchoMode(from: commonPayload)
+        let suppressesRequestLog = commonPayload[requestLogSuppressionControlKey] as? Bool ?? false
         guard let baseURL = URL(string: model.provider.baseURL) else {
             logger.error("构建聊天请求失败: 无效的 API 基础 URL - \(model.provider.baseURL)")
             return nil
@@ -178,7 +185,7 @@ public class AnthropicAdapter: APIAdapter {
         
         let chatURL = baseURL.appendingPathComponent("messages")
         
-        guard let apiKey = model.provider.apiKeys.randomElement(), !apiKey.isEmpty else {
+        guard let apiKey = commonPayload[providerAPIKeyControlKey] as? String ?? model.provider.nextAPIKey(), !apiKey.isEmpty else {
             logger.error("构建聊天请求失败: 提供商 '\(model.provider.name)' 未配置有效的 API Key。")
             return nil
         }
@@ -387,11 +394,14 @@ public class AnthropicAdapter: APIAdapter {
         }
 
         payload = mergedRequestPayload(payload, with: passthroughAnthropicRequestOverrides(overrides))
+        payload.removeValue(forKey: requestLogSuppressionControlKey)
         
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
             logger.debug("已构建 Anthropic 聊天请求体，共 \(request.httpBody?.count ?? 0) 字节。")
-            logChatRequestSnapshot(adapterName: "Anthropic", request: request, payload: payload)
+            if !suppressesRequestLog {
+                logChatRequestSnapshot(adapterName: "Anthropic", request: request, payload: payload)
+            }
         } catch {
             logger.error("构建聊天请求失败: JSON 序列化错误 - \(error.localizedDescription)")
             return nil
@@ -401,7 +411,9 @@ public class AnthropicAdapter: APIAdapter {
     }
 
     private func passthroughAnthropicRequestOverrides(_ overrides: [String: Any]) -> [String: Any] {
-        overrides.filter { $0.key != "thinking_budget" }
+        overrides.filter {
+            $0.key != "thinking_budget" && $0.key != requestLogSuppressionControlKey
+        }
     }
     
     public func buildModelListRequest(for provider: Provider) -> URLRequest? {
@@ -410,7 +422,7 @@ public class AnthropicAdapter: APIAdapter {
             return nil
         }
 
-        guard let apiKey = provider.apiKeys.randomElement(), !apiKey.isEmpty else {
+        guard let apiKey = provider.nextAPIKey(), !apiKey.isEmpty else {
             logger.error("构建模型列表请求失败: 提供商 '\(provider.name)' 未配置有效的 API Key。")
             return nil
         }
@@ -639,16 +651,26 @@ public class AnthropicAdapter: APIAdapter {
         if usage.input_tokens == nil
             && usage.output_tokens == nil
             && usage.cache_creation_input_tokens == nil
+            && usage.cache_creation?.ephemeral_5m_input_tokens == nil
+            && usage.cache_creation?.ephemeral_1h_input_tokens == nil
             && usage.cache_read_input_tokens == nil {
             return nil
         }
+        let fiveMinuteTokens = usage.cache_creation?.ephemeral_5m_input_tokens
+        let oneHourTokens = usage.cache_creation?.ephemeral_1h_input_tokens
+        let cacheWriteTokens = usage.cache_creation_input_tokens
+            ?? ((fiveMinuteTokens != nil || oneHourTokens != nil)
+                ? (fiveMinuteTokens ?? 0) + (oneHourTokens ?? 0) : nil)
         return MessageTokenUsage(
             promptTokens: usage.input_tokens,
             completionTokens: usage.output_tokens,
             totalTokens: nil,
             thinkingTokens: nil,
-            cacheWriteTokens: usage.cache_creation_input_tokens,
-            cacheReadTokens: usage.cache_read_input_tokens
+            cacheWriteTokens: cacheWriteTokens,
+            cacheWriteFiveMinuteTokens: fiveMinuteTokens,
+            cacheWriteOneHourTokens: oneHourTokens,
+            cacheReadTokens: usage.cache_read_input_tokens,
+            uncachedInputTokens: usage.input_tokens
         )
     }
     

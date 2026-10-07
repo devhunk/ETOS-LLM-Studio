@@ -21,6 +21,7 @@ struct ChatTranscriptSwiftUIImageConfiguration {
     let inputPlaceholder: String
     let prefersDarkAppearance: Bool
     let locale: Locale
+    let sizeCategory: ContentSizeCategory
     let rootFont: Font
     let composerInputHeight: CGFloat
     let composerActionIconName: String
@@ -61,9 +62,13 @@ enum ChatTranscriptSwiftUIImageRenderer {
         let preloadedAttachments = try await attachmentPreload
         try Task.checkCancellation()
 
+        let versionIndex = await Task.detached(priority: .userInitiated) {
+            ChatResponseAttemptSupport.versionInfoByMessageID(in: sourceMessages)
+        }.value
         let rows = makeRows(
             preparedMessages: preparedMessages,
             sourceMessages: sourceMessages,
+            versionIndex: versionIndex,
             includeReasoning: includeReasoning
         )
 
@@ -76,6 +81,7 @@ enum ChatTranscriptSwiftUIImageRenderer {
         .environment(\.chatTranscriptPreloadedAttachmentImages, preloadedAttachments.images)
         .environment(\.colorScheme, configuration.prefersDarkAppearance ? .dark : .light)
         .environment(\.locale, configuration.locale)
+        .environment(\.sizeCategory, configuration.sizeCategory)
         .environment(\.font, configuration.rootFont)
         .frame(width: configuration.width)
         .fixedSize(horizontal: false, vertical: true)
@@ -138,6 +144,7 @@ enum ChatTranscriptSwiftUIImageRenderer {
     private static func makeRows(
         preparedMessages: [ChatTranscriptPreparedMessage],
         sourceMessages: [ChatMessage],
+        versionIndex: [UUID: ChatResponseAttemptVersionInfo],
         includeReasoning: Bool
     ) -> [ChatTranscriptRenderedRow] {
         let displaySourceMessages = ChatTranscriptExportService.visibleImageMessages(
@@ -192,10 +199,7 @@ enum ChatTranscriptSwiftUIImageRenderer {
                 messageActionBarContinuesToNext: continuesActionBar,
                 connectsTimelineFromPrevious: connectsFromPrevious,
                 connectsTimelineToNext: connectsToNext,
-                responseAttemptVersionInfo: ChatResponseAttemptSupport.versionInfo(
-                    for: prepared.message,
-                    in: sourceMessages
-                ),
+                responseAttemptVersionInfo: versionIndex[prepared.message.id],
                 canRetry: retryableMessageIDs.contains(prepared.message.id),
                 disablesAdvancedRenderer: prepared.markdown.containsMermaidContent
                     || prepared.reasoningMarkdown?.containsMermaidContent == true
@@ -401,7 +405,7 @@ private struct ChatTranscriptExportForeground: View {
                             && !row.disablesAdvancedRenderer,
                         enableExperimentalToolResultDisplay: true,
                         enableMathRendering: configuration.enableAdvancedRenderer,
-                        showsStreamingIndicators: false,
+                        isCurrentResponse: false,
                         mergeWithPrevious: row.mergeWithPrevious,
                         mergeWithNext: row.mergeWithNext,
                         messageActionBarContinuesToNext: row.messageActionBarContinuesToNext,
@@ -756,7 +760,7 @@ private final class ChatTranscriptCGImageBox: @unchecked Sendable {
 extension ChatView {
     func transcriptSwiftUIImageConfiguration(
         session: ChatSession?
-    ) -> ChatTranscriptSwiftUIImageConfiguration {
+    ) async -> ChatTranscriptSwiftUIImageConfiguration {
         let windowBounds = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .flatMap(\.windows)
@@ -764,6 +768,9 @@ extension ChatView {
             .bounds ?? UIScreen.main.bounds
         let exportWidth = min(430, max(1, windowBounds.width))
         let viewportHeight = max(1, windowBounds.height)
+        let backgroundImage = await viewModel.backgroundImageForExport(
+            size: CGSize(width: exportWidth, height: viewportHeight), scale: max(2, displayScale)
+        )
         let measuredPointSize = CGFloat(
             FontLibrary.scaledPointSize(
                 16,
@@ -798,9 +805,11 @@ extension ChatView {
             inputPlaceholder: NSLocalizedString("Message", comment: "聊天长图输入框占位文本"),
             prefersDarkAppearance: colorScheme == .dark,
             locale: AppLanguagePreference.preferredLocale(rawValue: appConfig.appLanguage),
-            rootFont: AppFontAdapter.adaptedFont(
+            sizeCategory: sizeCategory,
+            rootFont: await AppFontAdapter.adaptedFont(
                 from: .body,
-                sampleText: "The quick brown fox 你好こんにちは"
+                sampleText: "The quick brown fox 你好こんにちは",
+                sizeCategory: sizeCategory
             ),
             composerInputHeight: composerInputHeight,
             composerActionIconName: actionIconName,
@@ -811,7 +820,7 @@ extension ChatView {
             enableAdvancedRenderer: viewModel.enableAdvancedRenderer,
             reasoningPreviewMaxHeight: responsiveReasoningPreviewMaxHeight(for: viewportHeight),
             backgroundMediaURL: viewModel.currentBackgroundMediaURL,
-            backgroundImage: viewModel.currentBackgroundImageBlurredUIImage,
+            backgroundImage: backgroundImage,
             backgroundIsVideo: viewModel.currentBackgroundIsVideo,
             backgroundOpacity: viewModel.backgroundOpacity,
             backgroundBlurRadius: viewModel.backgroundBlur,

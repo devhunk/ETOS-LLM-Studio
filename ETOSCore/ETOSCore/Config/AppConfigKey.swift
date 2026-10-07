@@ -203,7 +203,7 @@ public enum LocalLinuxChatPreviewPlacement: String, CaseIterable, Identifiable, 
 
 public enum LiquidGlassTintSetting {
     public static let minimumOpacity = 0.0
-    public static let maximumOpacity = 0.6
+    public static let maximumOpacity = 1.0
     public static let defaultOpacity = 0.3
     public static let opacityStep = 0.05
 
@@ -265,6 +265,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case localLinuxEnabled = "localLinux.enabled"
     case localLinuxEnvironmentPrivacyEnabled = "localLinux.environmentPrivacy.enabled"
     case localLinuxCommandSafetyEnabled = "localLinux.commandSafety.enabled"
+    case localLinuxDefaultMountAccess = "localLinux.mount.defaultAccess"
     case localLinuxDefaultShellPath = "localLinux.terminal.defaultShellPath"
     case localLinuxDefaultSessionMode = "localLinux.defaultSessionMode"
     case localLinuxDefaultTimeoutSeconds = "localLinux.defaultTimeoutSeconds"
@@ -290,6 +291,9 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case configLoaderDownloadOnceCompleted = "com.ETOS.LLM.Studio.download_once.completed"
     case configLoaderToolCapabilityMigrated = "com.ETOS.LLM.Studio.modelCapability.toolCalling.migrated"
     case feedbackAPIBaseURL = "feedback.apiBaseURL"
+    case guideOverlayEnabled = "guide.overlay.enabled"
+    case guidePreferredRoute = "guide.preferredRoute"
+    case guidePreferredModelIdentifier = "guide.preferredModelIdentifier"
     case appLockEnabled = "security.appLock.enabled"
     case appLockTimeoutSeconds = "security.appLock.timeoutSeconds"
     case appLockBiometricEnabled = "security.appLock.biometricEnabled"
@@ -304,6 +308,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case enableContextCompressionReminder = "contextCompression.reminder.enabled"
     case contextCompressionReminderTokenThreshold = "contextCompression.reminder.tokenThreshold"
     case enableStreaming = "enableStreaming"
+    case maximumRequestRetries = "chat.maximumRequestRetries"
+    case requestRetrySmartDetectionEnabled = "chat.retry.smartDetectionEnabled"
     case enableResponseSpeedMetrics = "enableResponseSpeedMetrics"
     case requestLogEnabled = "logs.request.enabled"
     case requestLogPlainMessageEnabled = "logs.request.plainMessageEnabled"
@@ -339,6 +345,10 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
 
     case speechModelIdentifier = "speechModelIdentifier"
     case ttsModelIdentifier = "ttsModelIdentifier"
+    case ttsServiceConfiguration = "tts.serviceConfiguration"
+    case ttsCacheNetworkAudioForReplay = "tts.cacheNetworkAudioForReplay"
+    case ttsTextSelectionMode = "tts.textSelectionMode"
+    case ttsFilterCodeAndHTML = "tts.filterCodeAndHTML"
     case memoryEmbeddingModelIdentifier = "memoryEmbeddingModelIdentifier"
     case titleGenerationModelIdentifier = "titleGenerationModelIdentifier"
     case dailyPulseModelIdentifier = "dailyPulseModelIdentifier"
@@ -349,6 +359,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case imageGenerationParameterExpressionsByModel = "imageGenerationParameterExpressionsByModel"
 
     case enableMarkdown = "enableMarkdown"
+    case userMessagePreviewCharacterLimit = "chat.userMessagePreview.characterLimit"
     case enableAdvancedRenderer = "enableAdvancedRenderer"
     case enableExperimentalToolResultDisplay = "enableExperimentalToolResultDisplay"
     case enableAutoReasoningPreview = "enableAutoReasoningPreview"
@@ -403,6 +414,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case enableSlashCommands = "chat.slashCommands.enabled"
     case customChatSlashCommands = "chat.slashCommands.custom"
     case chatComposerStyle = "chat.composer.style"
+    case iOSHardwareKeyboardReturnSendsMessage = "chat.composer.hardwareKeyboard.returnSendsMessage.iOS"
     case chatComposerDraft = "chat.composer.draft"
     case restoreLastSessionOnLaunch = "launch.restoreLastSessionOnLaunchEnabled"
     case restoreLastSessionOnlyIfRecent = "launch.restoreLastSessionOnlyIfRecent"
@@ -489,6 +501,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .localLinuxCommandSafetyEnabled,
              .localLinuxLocalMCPOnDemand:
             return .bool(true)
+        case .localLinuxDefaultMountAccess:
+            return .text(LocalLinuxMountAccess.readOnly.rawValue)
         case .localLinuxDefaultShellPath:
             return .text(LocalLinuxTerminalShellConfiguration.defaultPath)
         case .localLinuxDefaultSessionMode:
@@ -537,6 +551,12 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .bool(false)
         case .feedbackAPIBaseURL:
             return .text("")
+        case .guideOverlayEnabled:
+            return .bool(false)
+        case .guidePreferredRoute:
+            return .text("builtIn")
+        case .guidePreferredModelIdentifier:
+            return .text("")
         case .appLockTimeoutSeconds:
             return .integer(300)
 
@@ -568,6 +588,10 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             #else
             return .bool(true)
             #endif
+        case .maximumRequestRetries:
+            return .integer(ChatRequestRetryPolicy.defaultMaximumRetries)
+        case .requestRetrySmartDetectionEnabled:
+            return .bool(true)
         case .enableResponseSpeedMetrics:
             #if os(watchOS)
             return .bool(false)
@@ -636,6 +660,12 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .videoAnalysisModelIdentifier,
              .imageGenerationModelIdentifier:
             return .text("")
+        case .ttsServiceConfiguration:
+            return .text("{\"services\":[],\"selectedServiceID\":null,\"didMigrateLegacyModel\":false}")
+        case .ttsCacheNetworkAudioForReplay, .ttsFilterCodeAndHTML:
+            return .bool(false)
+        case .ttsTextSelectionMode:
+            return .text("")
         case .ocrModelIdentifier:
             #if os(watchOS)
             return .text("")
@@ -688,6 +718,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             #else
             return .real(20.8)
             #endif
+        case .userMessagePreviewCharacterLimit:
+            return .integer(ChatUserMessagePreview.defaultCharacterLimit)
         case .backgroundContentMode:
             return .text("fill")
         case .currentBackgroundImage:
@@ -715,6 +747,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .text("")
         case .chatComposerStyle:
             return .text(ChatComposerStyle.capsule.rawValue)
+        case .iOSHardwareKeyboardReturnSendsMessage:
+            return .bool(true)
         case .watchAttachmentSourceHistory,
              .watchBackgroundSourceHistory:
             return .text("[]")
@@ -835,6 +869,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .requestLogPlainMessageEnabled,
              .performanceTelemetryEnabled,
              .watchUseThirdPartyKeyboard,
+             .iOSHardwareKeyboardReturnSendsMessage,
              .localDebugLastServerAddress,
              .iOSModelPickerExpandedGroupIDs,
              .watchModelPickerExpandedGroupIDs,
@@ -848,6 +883,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .localModelPerformanceMonitorEnabled,
              .localModelCacheEnabled,
              .localModelKVCacheEnabled,
+             .localLinuxDefaultMountAccess,
              .localLinuxDefaultShellPath:
             return false
         default:

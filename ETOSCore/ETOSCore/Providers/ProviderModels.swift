@@ -103,6 +103,10 @@ public struct Provider: Codable, Identifiable, Hashable {
     public var chatEndpointPath: String
     /// 提供商 API Key，会随 Provider 一起持久化到 JSON（明文）。
     public var apiKeys: [String]
+    public var multiKeyEnabled: Bool
+    /// 备注按密钥关联，去重或调整顺序时不会串到另一条凭据。
+    public var apiKeyNotes: [String: String]
+    public var maximumKeyRetries: Int
     public var apiFormat: String // 例如: "openai-compatible"
     public var models: [Model]
     public var headerOverrides: [String: String]
@@ -118,13 +122,19 @@ public struct Provider: Codable, Identifiable, Hashable {
         apiFormat: String,
         models: [Model] = [],
         headerOverrides: [String: String] = [:],
-        proxyConfiguration: NetworkProxyConfiguration? = nil
+        proxyConfiguration: NetworkProxyConfiguration? = nil,
+        multiKeyEnabled: Bool? = nil,
+        apiKeyNotes: [String: String] = [:],
+        maximumKeyRetries: Int = ProviderAPIKeyRetryPolicy.defaultMaximumRetries
     ) {
         self.id = id
         self.name = name
         self.baseURL = baseURL
         self.chatEndpointPath = Self.normalizedChatEndpointPath(chatEndpointPath)
         self.apiKeys = apiKeys
+        self.multiKeyEnabled = multiKeyEnabled ?? (apiKeys.count > 1)
+        self.apiKeyNotes = apiKeyNotes
+        self.maximumKeyRetries = min(10, max(0, maximumKeyRetries))
         self.apiFormat = apiFormat
         self.models = models
         self.headerOverrides = headerOverrides
@@ -133,6 +143,7 @@ public struct Provider: Codable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, baseURL, chatEndpointPath, chatCompletionsPath, apiKeys, apiFormat, models, headerOverrides, proxyConfiguration
+        case multiKeyEnabled, apiKeyNotes, maximumKeyRetries
     }
 
     public init(from decoder: Decoder) throws {
@@ -145,6 +156,10 @@ public struct Provider: Codable, Identifiable, Hashable {
             ?? Self.defaultChatEndpointPath
         self.chatEndpointPath = Self.normalizedChatEndpointPath(decodedChatEndpointPath)
         self.apiKeys = try container.decodeIfPresent([String].self, forKey: .apiKeys) ?? []
+        self.multiKeyEnabled = try container.decodeIfPresent(Bool.self, forKey: .multiKeyEnabled) ?? (apiKeys.count > 1)
+        self.apiKeyNotes = try container.decodeIfPresent([String: String].self, forKey: .apiKeyNotes) ?? [:]
+        self.maximumKeyRetries = min(10, max(0, try container.decodeIfPresent(Int.self, forKey: .maximumKeyRetries)
+            ?? ProviderAPIKeyRetryPolicy.defaultMaximumRetries))
         self.apiFormat = try container.decode(String.self, forKey: .apiFormat)
         self.models = try container.decodeIfPresent([Model].self, forKey: .models) ?? []
         self.headerOverrides = try container.decodeIfPresent([String: String].self, forKey: .headerOverrides) ?? [:]
@@ -163,6 +178,9 @@ public struct Provider: Codable, Identifiable, Hashable {
         if !apiKeys.isEmpty {
             try container.encode(apiKeys, forKey: .apiKeys)
         }
+        try container.encode(multiKeyEnabled, forKey: .multiKeyEnabled)
+        try container.encode(apiKeyNotes, forKey: .apiKeyNotes)
+        try container.encode(maximumKeyRetries, forKey: .maximumKeyRetries)
         try container.encode(apiFormat, forKey: .apiFormat)
         try container.encode(models, forKey: .models)
         if !headerOverrides.isEmpty {
@@ -209,16 +227,25 @@ public enum ModelKind: String, Codable, Hashable, CaseIterable, Sendable {
     case chat
     case image
     case embedding
-    // 旧版本曾把专用服务路由暴露为模型类型；保留原始值只为兼容已有配置。
+    // 重排与 TTS 仅保留原始值用于读取旧配置，不再作为通用模型用途提供。
     case rerank
     case textToSpeech
 
-    /// 普通模型配置只呈现用户能够直接使用的三种用途。
+    /// 模型配置只呈现通用模型链路能够直接分配的用途。
     public static let allCases: [ModelKind] = [
         .chat,
         .image,
         .embedding
     ]
+
+    public var supportsConnectivityTest: Bool {
+        switch self {
+        case .chat, .image, .embedding:
+            return true
+        case .rerank, .textToSpeech:
+            return false
+        }
+    }
 
     public var localizedName: String {
         switch self {
@@ -273,7 +300,8 @@ public enum ModelCapability: String, Codable, Hashable, CaseIterable, Sendable {
     public static let editableCases: [ModelCapability] = [
         .toolCalling,
         .reasoning,
-        .promptCaching
+        .promptCaching,
+        .textToSpeech
     ]
 
     public var localizedName: String {
@@ -330,6 +358,8 @@ public struct Model: Codable, Identifiable, Hashable {
     public var rawRequestBodyJSON: String?
     public var requestBodyControls: [ModelRequestBodyControl]
     public var pricing: ModelPricing?
+    /// 仅在请求模板引用 model_prompt 时插入，不自动追加到系统提示词。
+    public var prompt: String
 
     public init(
         id: UUID = UUID(),
@@ -347,7 +377,8 @@ public struct Model: Codable, Identifiable, Hashable {
         requestBodyOverrideMode: RequestBodyOverrideMode = .keyValue,
         rawRequestBodyJSON: String? = nil,
         requestBodyControls: [ModelRequestBodyControl] = [],
-        pricing: ModelPricing? = nil
+        pricing: ModelPricing? = nil,
+        prompt: String = ""
     ) {
         let normalized = Self.normalizedCapabilityShape(
             kind: kind,
@@ -372,6 +403,7 @@ public struct Model: Codable, Identifiable, Hashable {
         self.requestBodyControls = requestBodyControls
         let normalizedPricing = pricing?.normalized
         self.pricing = normalizedPricing?.isEffectivelyEmpty == true ? nil : normalizedPricing
+        self.prompt = prompt
     }
 
     public init(
@@ -386,7 +418,8 @@ public struct Model: Codable, Identifiable, Hashable {
         requestBodyOverrideMode: RequestBodyOverrideMode = .keyValue,
         rawRequestBodyJSON: String? = nil,
         requestBodyControls: [ModelRequestBodyControl] = [],
-        pricing: ModelPricing? = nil
+        pricing: ModelPricing? = nil,
+        prompt: String = ""
     ) {
         self.init(
             id: id,
@@ -401,7 +434,8 @@ public struct Model: Codable, Identifiable, Hashable {
             requestBodyOverrideMode: requestBodyOverrideMode,
             rawRequestBodyJSON: rawRequestBodyJSON,
             requestBodyControls: requestBodyControls,
-            pricing: pricing
+            pricing: pricing,
+            prompt: prompt
         )
     }
 
@@ -412,6 +446,7 @@ public struct Model: Codable, Identifiable, Hashable {
         case rawRequestBodyJSON
         case requestBodyControls
         case pricing
+        case prompt
     }
 
     public init(from decoder: Decoder) throws {
@@ -452,6 +487,7 @@ public struct Model: Codable, Identifiable, Hashable {
         self.requestBodyControls = try container.decodeIfPresent([ModelRequestBodyControl].self, forKey: .requestBodyControls) ?? []
         let decodedPricing = try container.decodeIfPresent(ModelPricing.self, forKey: .pricing)?.normalized
         self.pricing = decodedPricing?.isEffectivelyEmpty == true ? nil : decodedPricing
+        self.prompt = try container.decodeIfPresent(String.self, forKey: .prompt) ?? ""
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -494,6 +530,9 @@ public struct Model: Codable, Identifiable, Hashable {
         }
         if let pricing = pricing?.normalized, !pricing.isEffectivelyEmpty {
             try container.encode(pricing, forKey: .pricing)
+        }
+        if !prompt.isEmpty {
+            try container.encode(prompt, forKey: .prompt)
         }
     }
 

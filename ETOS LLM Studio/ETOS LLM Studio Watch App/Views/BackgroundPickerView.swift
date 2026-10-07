@@ -91,17 +91,19 @@ struct BackgroundPickerView: View {
             }
         }
         .navigationTitle(NSLocalizedString("选择背景", comment: ""))
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    deleteCandidate = selectedBackground
-                    isShowingDeleteConfirmation = true
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .disabled(selectedBackground.isEmpty)
+        .guideSettingsPageContext(
+            id: "settings-background-picker",
+            title: NSLocalizedString("选择背景", comment: "背景选择向导上下文标题"),
+            documents: [GuideDocumentReference(id: "settings-display", title: "Display Settings")],
+            settings: backgroundGuideSettings
+        )
+        .watchGuideEntry(actions: [
+            WatchPageAction(title: NSLocalizedString("删除背景", comment: ""), systemImage: "trash", isEnabled: !selectedBackground.isEmpty, role: .destructive) {
+                deleteCandidate = selectedBackground
+                isShowingDeleteConfirmation = true
             }
-
+        ])
+        .toolbar {
             ToolbarItem(placement: .bottomBar) {
                 HStack {
                     Button {
@@ -190,6 +192,30 @@ struct BackgroundPickerView: View {
             }.value
             backgrounds = loaded.isEmpty ? allBackgrounds : loaded
         }
+    }
+
+    private var backgroundGuideSettings: [GuidePageSetting] {
+        let available = backgrounds.isEmpty ? allBackgrounds : backgrounds
+        return [
+            .readOnly(
+                "available_backgrounds",
+                label: NSLocalizedString("可用背景", comment: "背景选择向导字段"),
+                value: { .array(available.map(JSONValue.string)) }
+            ),
+            .string(
+                "selected_background",
+                label: NSLocalizedString("当前背景", comment: "背景选择向导字段"),
+                allowedValues: available,
+                allowsEmpty: false,
+                get: { selectedBackground },
+                set: { selectedBackground = $0 }
+            ),
+            .readOnly(
+                "import_source_history",
+                label: NSLocalizedString("背景导入来源记录", comment: "背景选择向导字段"),
+                value: { .array(backgroundSourceHistory.map(JSONValue.string)) }
+            )
+        ]
     }
     
     // MARK: - 私有方法

@@ -38,7 +38,7 @@ struct ChatBubble: View {
     let enableAdvancedRenderer: Bool
     let enableExperimentalToolResultDisplay: Bool
     let enableMathRendering: Bool
-    let showsStreamingIndicators: Bool
+    let isCurrentResponse: Bool
     let mergeWithPrevious: Bool
     let mergeWithNext: Bool
     let messageActionBarContinuesToNext: Bool
@@ -57,6 +57,7 @@ struct ChatBubble: View {
     let isSelected: Bool
     let onToggleSelection: () -> Void
     let onOpenMore: (() -> Void)?
+    let onOpenFullContent: ((ChatMessage) -> Void)?
     let sourceConversationName: String?
     let onOpenSourceConversation: (() -> Void)?
     let onOpenConversation: ((UUID) -> Void)?
@@ -70,6 +71,7 @@ struct ChatBubble: View {
     @State var webHTMLPageItem: WatchWebHTMLPageItem?
     @State var showRawToolResultInDetailSheet: Bool = false
     @ObservedObject var toolPermissionCenter = ToolPermissionCenter.shared
+    @ObservedObject var mcpManager = MCPManager.shared
     @ObservedObject private var appearanceProfileManager = ChatAppearanceProfileManager.shared
     @ObservedObject var appConfig = AppConfigStore.shared
     @Environment(\.displayScale) var displayScale
@@ -93,7 +95,7 @@ struct ChatBubble: View {
         enableAdvancedRenderer: Bool = false,
         enableExperimentalToolResultDisplay: Bool = true,
         enableMathRendering: Bool = false,
-        showsStreamingIndicators: Bool,
+        isCurrentResponse: Bool,
         mergeWithPrevious: Bool,
         mergeWithNext: Bool,
         messageActionBarContinuesToNext: Bool = false,
@@ -112,6 +114,7 @@ struct ChatBubble: View {
         isSelected: Bool = false,
         onToggleSelection: @escaping () -> Void = {},
         onOpenMore: (() -> Void)? = nil,
+        onOpenFullContent: ((ChatMessage) -> Void)? = nil,
         sourceConversationName: String? = nil,
         onOpenSourceConversation: (() -> Void)? = nil,
         onOpenConversation: ((UUID) -> Void)? = nil,
@@ -134,7 +137,7 @@ struct ChatBubble: View {
         self.enableAdvancedRenderer = enableAdvancedRenderer
         self.enableExperimentalToolResultDisplay = enableExperimentalToolResultDisplay
         self.enableMathRendering = enableMathRendering
-        self.showsStreamingIndicators = showsStreamingIndicators
+        self.isCurrentResponse = isCurrentResponse
         self.mergeWithPrevious = mergeWithPrevious
         self.mergeWithNext = mergeWithNext
         self.messageActionBarContinuesToNext = messageActionBarContinuesToNext
@@ -153,6 +156,7 @@ struct ChatBubble: View {
         self.isSelected = isSelected
         self.onToggleSelection = onToggleSelection
         self.onOpenMore = onOpenMore
+        self.onOpenFullContent = onOpenFullContent
         self.sourceConversationName = sourceConversationName
         self.onOpenSourceConversation = onOpenSourceConversation
         self.onOpenConversation = onOpenConversation
@@ -270,6 +274,7 @@ struct ChatBubble: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .environment(\.thinkingSweepUsesRainbow, messageState.message.usesRainbowThinkingSweep)
         .padding(.horizontal, usesNoBubbleStyle ? noBubbleRowHorizontalPadding : nil)
         .padding(.top, mergeWithPrevious ? 0 : rowVerticalPadding)
         .padding(.bottom, mergeWithNext ? 0 : rowVerticalPadding)
@@ -306,7 +311,7 @@ struct ChatBubble: View {
             refreshChatBubbleLocalPresentationBlocker()
         }) { item in
             NavigationStack {
-                WatchWebHTMLPage(item: item)
+                WatchWebHTMLPage(item: item, onCopy: onCodeBlockHeaderTap)
             }
         }
         .onAppear {
@@ -433,6 +438,22 @@ struct ChatBubble: View {
                let imageFileNames = message.imageFileNames,
                !imageFileNames.isEmpty {
                 imageAttachmentsView(fileNames: imageFileNames, isOutgoing: false)
+            }
+
+            if message.role == .assistant,
+               !showsStreamingIndicators,
+               preparedMarkdownPayload?.containsMathContent == true,
+               let onOpenFullContent,
+               !isSelectionMode {
+                Button {
+                    // 公式页沿用已应用展示正则的正文，与气泡及“更多”中的公式预览保持一致。
+                    onOpenFullContent(message)
+                } label: {
+                    Text(NSLocalizedString("查看完整内容", comment: ""))
+                        .etFont(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
 
             if shouldShowMessageActionBar {
@@ -597,16 +618,18 @@ struct ChatBubble: View {
                 }
 
                 if shouldShowThinkingIndicator {
-                    if showsStreamingIndicators {
+                    if shouldShimmerThinkingPlaceholder {
                         ShimmeringText(
                             text: currentThinkingText,
                             font: .caption,
                             baseColor: resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.75),
                             highlightColor: resolvedTextColor(default: .primary.opacity(0.85))
                         )
+                        .monospacedDigit()
                     } else {
                         Text(currentThinkingText)
                             .etFont(.caption)
+                            .monospacedDigit()
                             .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.75))
                     }
                 }

@@ -98,6 +98,11 @@ struct LocalLinuxWatchFeatureView: View {
             LocalLinuxWatchResourceStatusView()
 
             Section {
+                SettingsHelpCard(
+                    title: NSLocalizedString("默认终端 Shell", comment: "终端 Shell 说明标题"),
+                    summary: NSLocalizedString("选择新终端使用的命令解释器。", comment: "终端 Shell 说明摘要"),
+                    details: NSLocalizedString("只列出当前 Linux 系统中已安装的 Shell。新终端会以登录 Shell 启动；Agent 的脚本命令仍固定使用 /bin/sh。", comment: "终端 Shell 使用说明")
+                )
                 Picker(
                     NSLocalizedString("默认终端 Shell", comment: "Watch default interactive Linux shell setting"),
                     selection: $appConfig.localLinuxDefaultShellPath
@@ -107,7 +112,7 @@ struct LocalLinuxWatchFeatureView: View {
                     }
                 }
             } footer: {
-                Text(NSLocalizedString("只列出当前 Linux 系统中已安装的 Shell。新终端会以登录 Shell 启动；Agent 的脚本命令仍固定使用 /bin/sh。", comment: "Watch default interactive Linux shell footer"))
+                Text(NSLocalizedString("仅影响新终端，Agent 脚本仍使用 /bin/sh。", comment: "默认终端 Shell 页脚"))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -173,7 +178,7 @@ struct LocalLinuxWatchFeatureView: View {
                 if isResettingSystem {
                     HStack {
                         ProgressView()
-                        Text(NSLocalizedString("正在重置并重新启动…", comment: "Watch resetting local Linux status"))
+                        Text(NSLocalizedString("正在重置 Linux…", comment: "正在清除 Linux 系统"))
                     }
                 } else if let resetStatusMessage {
                     Label(resetStatusMessage, systemImage: "checkmark.circle.fill")
@@ -190,6 +195,25 @@ struct LocalLinuxWatchFeatureView: View {
             }
         }
         .navigationTitle(NSLocalizedString("本地 Linux", comment: "Watch local Linux title"))
+        .guideSettingsPageContext(
+            id: "watch-settings-local-linux",
+            title: NSLocalizedString("本地 Linux", comment: "手表本地 Linux 向导上下文标题"),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .bool("enabled", label: NSLocalizedString("启用本地 Linux", comment: "向导设置字段"), get: { appConfig.localLinuxEnabled }, set: { appConfig.localLinuxEnabled = $0 }),
+                .string("default_shell_path", label: NSLocalizedString("默认终端 Shell", comment: "向导设置字段"), allowedValues: availableTerminalShellPaths, allowsEmpty: false, get: { appConfig.localLinuxDefaultShellPath }, set: { appConfig.localLinuxDefaultShellPath = $0 }),
+                .string("default_session_mode", label: NSLocalizedString("新会话默认模式", comment: "向导设置字段"), allowedValues: LocalAgentMode.allCases.map(\.rawValue), get: { appConfig.localLinuxDefaultSessionMode }, set: { appConfig.localLinuxDefaultSessionMode = $0 }),
+                .integer("default_timeout_seconds", label: NSLocalizedString("默认命令超时（秒）", comment: "向导设置字段"), range: 0...4_294_967, get: { appConfig.localLinuxDefaultTimeoutSeconds }, set: { appConfig.localLinuxDefaultTimeoutSeconds = $0 }),
+                .integer("model_output_limit_kb", label: NSLocalizedString("发送给模型的输出上限（KB）", comment: "向导设置字段"), range: 4...4_194_303, get: { max(4, appConfig.localLinuxOutputPreviewBytes / 1_024) }, set: { appConfig.localLinuxOutputPreviewBytes = $0 * 1_024 }),
+                .bool("redact_environment_values", label: NSLocalizedString("发送给模型前隐藏环境变量值", comment: "向导设置字段"), get: { appConfig.localLinuxEnvironmentPrivacyEnabled }, set: { appConfig.localLinuxEnvironmentPrivacyEnabled = $0 }),
+                .bool("command_safety_enabled", label: NSLocalizedString("启用命令安全策略", comment: "向导设置字段"), get: { appConfig.localLinuxCommandSafetyEnabled }, set: { appConfig.localLinuxCommandSafetyEnabled = $0 }),
+                .readOnly("runtime_phase", label: NSLocalizedString("运行时", comment: "向导设置字段"), value: { .string(snapshot.phase.displayName) }),
+                .readOnly("active_job_count", label: NSLocalizedString("命令与浏览器任务", comment: "向导设置字段"), value: { .int(snapshot.activeJobCount) }),
+                .readOnly("active_terminal_count", label: NSLocalizedString("终端", comment: "向导设置字段"), value: { .int(snapshot.activeTerminalCount) }),
+                .readOnly("active_mcp_process_count", label: NSLocalizedString("本地 MCP", comment: "向导设置字段"), value: { .int(snapshot.activeMCPProcessCount) })
+            ]
+        )
+        .watchGuideEntry()
         .task {
             snapshot = await LocalLinuxRuntimeController.shared.refreshInstalledState()
             await refreshAvailableTerminalShellPaths()
@@ -211,14 +235,13 @@ struct LocalLinuxWatchFeatureView: View {
                     defer { isResettingSystem = false }
                     do {
                         snapshot = try await LocalLinuxRuntimeController.shared.deleteSystem(deleteUserData: false)
-                        resetStatusMessage = appConfig.localLinuxEnabled
-                            ? NSLocalizedString("系统已重置并重新启动。", comment: "Watch local Linux reset completed")
-                            : NSLocalizedString("系统已重置。", comment: "Watch disabled local Linux reset completed")
+                        resetStatusMessage = NSLocalizedString("系统已重置，下次使用时会重新安装内置系统。", comment: "Linux 重置完成")
                     } catch { errorMessage = error.localizedDescription }
                 }
             }
             Button(NSLocalizedString("取消", comment: "Cancel"), role: .cancel) {}
         }
+        .localLinuxDiagnosticFeedback(priority: 1, blocked: errorMessage != nil || showResetConfirmation)
         .alert(NSLocalizedString("操作失败", comment: "Watch Linux operation failed"), isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
             Button(NSLocalizedString("好", comment: "Dismiss"), role: .cancel) {}
         } message: { Text(errorMessage ?? "") }
@@ -304,7 +327,7 @@ struct LocalLinuxWatchTerminalView: View {
     @State private var terminalJobs: [LocalLinuxJob] = []
     @State private var inputOwner: LocalLinuxTerminalInputOwner?
     @State private var terminalShortcuts = LocalLinuxTerminalShortcutConfiguration.defaults
-    @State private var output = LocalLinuxTerminalPresentation.empty
+    @State private var output: [LocalLinuxTerminalDisplayLine] = []
     @State private var input = ""
     @State private var errorMessage: String?
     @State private var outputTask: Task<Void, Never>?
@@ -350,15 +373,19 @@ struct LocalLinuxWatchTerminalView: View {
             }
             Section {
                 Group {
-                    if output.plainText.isEmpty {
+                    if output.isEmpty {
                         Text(NSLocalizedString("正在启动…", comment: "Watch Linux terminal starting"))
                             .foregroundStyle(.secondary)
                     } else {
-                        Text(output.attributedText)
+                        ForEach(output) { line in
+                            Text(line.displayText)
+                                .listRowInsets(EdgeInsets())
+                        }
                     }
                 }
                     .font(.caption2.monospaced())
                     .listRowBackground(Color.black)
+                    .environment(\.defaultMinListRowHeight, 0)
                 if isInputControlledByAgent {
                     Text(NSLocalizedString("输入由 Agent 控制；发送内容即可接管", comment: "Watch terminal Agent input owner"))
                         .font(.caption2)
@@ -410,8 +437,10 @@ struct LocalLinuxWatchTerminalView: View {
                 }
             }
         }
+        .listStyle(.plain)
         .preferredColorScheme(.dark)
         .navigationTitle(terminalNavigationTitle)
+        .localLinuxDiagnosticFeedback(priority: 2, active: isPresentationActive, blocked: errorMessage != nil)
         .task(id: isPresentationActive) {
             guard isPresentationActive else {
                 outputTask?.cancel()
@@ -469,18 +498,28 @@ struct LocalLinuxWatchTerminalView: View {
 
     private func attach(to selected: LocalLinuxJob) {
         job = selected
-        output = .empty
+        output = []
         outputTask?.cancel()
         outputTask = Task {
-            inputOwner = try? await LocalLinuxJobScheduler.shared.terminalInputOwner(jobID: selected.id)
-            while !Task.isCancelled {
-                output = (try? await LocalLinuxJobScheduler.shared.userVisibleTerminalPresentation(jobID: selected.id)) ?? output
-                let current = await LocalLinuxJobScheduler.shared.job(id: selected.id)
-                job = current
-                if current?.state.isTerminal == true { break }
-                try? await Task<Never, Never>.sleep(nanoseconds: 500_000_000)
+            let owner = try? await LocalLinuxJobScheduler.shared.terminalInputOwner(jobID: selected.id)
+            guard !Task.isCancelled else { return }
+            inputOwner = owner
+            if let updates = try? await LocalLinuxJobScheduler.shared.terminalDisplayUpdates(
+                jobID: selected.id,
+                appearance: .dark,
+                minimumInterval: .milliseconds(200)
+            ) {
+                for await presentation in updates {
+                    guard !Task.isCancelled else { return }
+                    output = presentation
+                }
             }
-            terminalJobs = visibleTerminalJobs(in: await LocalLinuxJobScheduler.shared.activeJobs())
+            let current = await LocalLinuxJobScheduler.shared.job(id: selected.id)
+            guard !Task.isCancelled else { return }
+            job = current
+            let jobs = await LocalLinuxJobScheduler.shared.activeJobs()
+            guard !Task.isCancelled else { return }
+            terminalJobs = visibleTerminalJobs(in: jobs)
         }
     }
 
@@ -610,6 +649,25 @@ private struct LocalLinuxWatchEnvironmentView: View {
                 .foregroundStyle(.secondary)
         }
         .navigationTitle(NSLocalizedString("环境变量", comment: "Watch Linux environment title"))
+        .guideSettingsPageContext(
+            id: "watch-settings-local-linux-environment",
+            title: NSLocalizedString("环境变量", comment: "Watch Linux environment guide title"),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .readOnly("variables", label: NSLocalizedString("变量", comment: "向导设置字段"), value: {
+                    .array(variables.map { variable in
+                        .dictionary([
+                            "id": .string(variable.id.uuidString),
+                            "name": .string(variable.name),
+                            "enabled": .bool(variable.isEnabled),
+                            "note": .string(variable.note),
+                            "value": .string(GuideSnapshotField.hiddenValue)
+                        ])
+                    })
+                })
+            ]
+        )
+        .watchGuideEntry()
         .task { await reload() }
         .onAppear { Task { await reload() } }
     }
@@ -645,6 +703,21 @@ private struct LocalLinuxWatchEnvironmentEditorView: View {
         .navigationTitle(isNew
             ? NSLocalizedString("添加变量", comment: "Watch add environment variable title")
             : draft.name)
+        .guideSettingsPageContext(
+            id: "watch-settings-local-linux-environment-editor",
+            title: isNew
+                ? NSLocalizedString("添加变量", comment: "Watch add environment variable guide title")
+                : String(format: NSLocalizedString("环境变量：%@", comment: "Linux environment variable guide title"), draft.name),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .string("name", label: NSLocalizedString("名称", comment: "向导设置字段"), allowsEmpty: false, get: { draft.name }, set: { draft.name = $0 }),
+                .writeOnlyString("value", label: NSLocalizedString("值", comment: "向导设置字段"), isConfigured: { !draft.value.isEmpty }, set: { draft.value = $0 }),
+                .string("note", label: NSLocalizedString("备注", comment: "向导设置字段"), get: { draft.note }, set: { draft.note = $0 }),
+                .bool("enabled", label: NSLocalizedString("启用", comment: "向导设置字段"), get: { draft.isEnabled }, set: { draft.isEnabled = $0 }),
+                .readOnly("requires_save", label: NSLocalizedString("应用方式", comment: "向导设置字段"), value: { .string(NSLocalizedString("修改后需要保存", comment: "向导草稿应用方式")) })
+            ]
+        )
+        .watchGuideEntry()
         .alert(NSLocalizedString("保存失败", comment: "Save failed"), isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
             Button(NSLocalizedString("好", comment: "Dismiss"), role: .cancel) {}
         } message: { Text(errorMessage ?? "") }
@@ -715,6 +788,29 @@ private struct LocalLinuxWatchSafetyView: View {
                 .foregroundStyle(.secondary)
         }
         .navigationTitle(NSLocalizedString("安全策略", comment: "Watch Linux safety title"))
+        .guideSettingsPageContext(
+            id: "watch-settings-local-linux-safety",
+            title: NSLocalizedString("命令安全策略", comment: "Watch Linux safety guide title"),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .bool("enabled", label: NSLocalizedString("启用命令安全策略", comment: "向导设置字段"), get: { appConfig.localLinuxCommandSafetyEnabled }, set: { appConfig.localLinuxCommandSafetyEnabled = $0 }),
+                .readOnly("rules", label: NSLocalizedString("规则", comment: "向导设置字段"), value: {
+                    .array(rules.map { rule in
+                        .dictionary([
+                            "id": .string(rule.id.uuidString),
+                            "name": .string(rule.name),
+                            "pattern": .string(rule.pattern),
+                            "match_kind": .string(rule.matchKind.rawValue),
+                            "scope": .string(rule.scope.rawValue),
+                            "action": .string(rule.action.rawValue),
+                            "enabled": .bool(rule.isEnabled),
+                            "priority": .int(rule.sortIndex)
+                        ])
+                    })
+                })
+            ]
+        )
+        .watchGuideEntry()
         .task { await reload() }
         .onAppear { Task { await reload() } }
     }
@@ -775,6 +871,24 @@ private struct LocalLinuxWatchSafetyRuleEditorView: View {
         .navigationTitle(draft.name.isEmpty
             ? NSLocalizedString("命令规则", comment: "Watch Linux command rule title")
             : draft.name)
+        .guideSettingsPageContext(
+            id: "watch-settings-local-linux-safety-rule-editor",
+            title: draft.name.isEmpty
+                ? NSLocalizedString("命令规则", comment: "Watch Linux command rule guide title")
+                : String(format: NSLocalizedString("命令规则：%@", comment: "Linux command rule guide title"), draft.name),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .string("name", label: NSLocalizedString("规则名称", comment: "向导设置字段"), get: { draft.name }, set: { draft.name = $0 }),
+                .string("pattern", label: NSLocalizedString("匹配内容", comment: "向导设置字段"), allowsEmpty: false, get: { draft.pattern }, set: { draft.pattern = $0 }),
+                .string("match_kind", label: NSLocalizedString("匹配方式", comment: "向导设置字段"), allowedValues: LocalLinuxCommandRuleMatchKind.allCases.map(\.rawValue), get: { draft.matchKind.rawValue }, set: { draft.matchKind = LocalLinuxCommandRuleMatchKind(rawValue: $0) ?? draft.matchKind }),
+                .string("scope", label: NSLocalizedString("作用范围", comment: "向导设置字段"), allowedValues: LocalLinuxCommandRuleScope.allCases.map(\.rawValue), get: { draft.scope.rawValue }, set: { draft.scope = LocalLinuxCommandRuleScope(rawValue: $0) ?? draft.scope }),
+                .string("action", label: NSLocalizedString("处理", comment: "向导设置字段"), allowedValues: LocalLinuxCommandRuleAction.allCases.map(\.rawValue), get: { draft.action.rawValue }, set: { draft.action = LocalLinuxCommandRuleAction(rawValue: $0) ?? draft.action }),
+                .bool("enabled", label: NSLocalizedString("启用规则", comment: "向导设置字段"), get: { draft.isEnabled }, set: { draft.isEnabled = $0 }),
+                .integer("priority", label: NSLocalizedString("优先级", comment: "向导设置字段"), range: 0...999, get: { draft.sortIndex }, set: { draft.sortIndex = $0 }),
+                .readOnly("requires_save", label: NSLocalizedString("应用方式", comment: "向导设置字段"), value: { .string(NSLocalizedString("修改后需要保存", comment: "向导草稿应用方式")) })
+            ]
+        )
+        .watchGuideEntry()
         .task { validatePattern() }
         .onChange(of: draft.pattern) { _, _ in validatePattern() }
         .onChange(of: draft.matchKind) { _, _ in validatePattern() }

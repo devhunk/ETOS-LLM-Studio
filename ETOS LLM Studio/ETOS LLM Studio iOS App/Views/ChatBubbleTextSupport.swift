@@ -11,15 +11,14 @@ import ETOSCore
 
 struct ShimmeringText: View {
     let text: String
-    let font: Font
+    let font: ETFont
     let baseColor: Color
     let highlightColor: Color
-    var duration: Double = 5
 
     var body: some View {
-        RainbowSweepForeground(baseColor: baseColor, duration: duration) {
+        ThinkingSweepForeground(baseColor: baseColor, highlightColor: highlightColor) {
             Text(text)
-                .etFont(font)
+                .etFont(font, sampleText: text)
         }
     }
 }
@@ -27,7 +26,7 @@ struct ShimmeringText: View {
 struct CappedScrollableText: View {
     let text: String
     let maxHeight: CGFloat
-    let font: Font
+    let font: ETFont
     let foreground: Color
     let enableSelection: Bool
     @State private var measuredHeight: CGFloat = 0
@@ -54,13 +53,13 @@ struct CappedScrollableText: View {
     private var textView: some View {
         if enableSelection {
             Text(text)
-                .etFont(font)
+                .etFont(font, sampleText: text)
                 .foregroundStyle(foreground)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             Text(text)
-                .etFont(font)
+                .etFont(font, sampleText: text)
                 .foregroundStyle(foreground)
                 .textSelection(.disabled)
                 .frame(maxWidth: .infinity, alignment: .leading)

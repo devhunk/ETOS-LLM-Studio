@@ -42,6 +42,51 @@ struct LocalLinuxFeatureView: View {
                 .tabItem { Label(NSLocalizedString("数据", comment: "Local Linux data tab"), systemImage: "internaldrive") }
         }
         .navigationTitle(NSLocalizedString("本地 Linux", comment: "Local Linux feature title"))
+        .guideSettingsPageContext(
+            id: "settings-local-linux",
+            title: NSLocalizedString("本地 Linux", comment: "本地 Linux 向导上下文标题"),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .bool("enabled", label: NSLocalizedString("启用本地 Linux", comment: "向导设置字段"), get: { appConfig.localLinuxEnabled }, set: { appConfig.localLinuxEnabled = $0 }),
+                .string(
+                    "chat_preview_mode",
+                    label: NSLocalizedString("聊天缩略图", comment: "向导设置字段"),
+                    allowedValues: LocalLinuxChatPreviewMode.allCases.map(\.rawValue),
+                    get: { appConfig.localLinuxChatPreviewMode },
+                    set: { appConfig.localLinuxChatPreviewMode = $0 }
+                ),
+                .string(
+                    "chat_preview_placement",
+                    label: NSLocalizedString("显示位置", comment: "向导设置字段"),
+                    allowedValues: LocalLinuxChatPreviewPlacement.allCases.map(\.rawValue),
+                    get: { appConfig.localLinuxChatPreviewPlacement },
+                    set: { appConfig.localLinuxChatPreviewPlacement = $0 }
+                ),
+                .string(
+                    "default_shell_path",
+                    label: NSLocalizedString("默认终端 Shell", comment: "向导设置字段"),
+                    allowedValues: availableTerminalShellPaths,
+                    allowsEmpty: false,
+                    get: { appConfig.localLinuxDefaultShellPath },
+                    set: { appConfig.localLinuxDefaultShellPath = $0 }
+                ),
+                .string(
+                    "default_session_mode",
+                    label: NSLocalizedString("新会话默认模式", comment: "向导设置字段"),
+                    allowedValues: LocalAgentMode.allCases.map(\.rawValue),
+                    get: { appConfig.localLinuxDefaultSessionMode },
+                    set: { appConfig.localLinuxDefaultSessionMode = $0 }
+                ),
+                .integer("default_timeout_seconds", label: NSLocalizedString("默认命令超时（秒）", comment: "向导设置字段"), range: 0...4_294_967, get: { appConfig.localLinuxDefaultTimeoutSeconds }, set: { appConfig.localLinuxDefaultTimeoutSeconds = $0 }),
+                .integer("model_output_limit_kb", label: NSLocalizedString("发送给模型的输出上限（KB）", comment: "向导设置字段"), range: 4...4_194_303, get: { max(4, appConfig.localLinuxOutputPreviewBytes / 1_024) }, set: { appConfig.localLinuxOutputPreviewBytes = $0 * 1_024 }),
+                .bool("redact_environment_values", label: NSLocalizedString("发送给模型前隐藏环境变量值", comment: "向导设置字段"), get: { appConfig.localLinuxEnvironmentPrivacyEnabled }, set: { appConfig.localLinuxEnvironmentPrivacyEnabled = $0 }),
+                .bool("command_safety_enabled", label: NSLocalizedString("启用命令安全策略", comment: "向导设置字段"), get: { appConfig.localLinuxCommandSafetyEnabled }, set: { appConfig.localLinuxCommandSafetyEnabled = $0 }),
+                .readOnly("runtime_phase", label: NSLocalizedString("运行时", comment: "向导设置字段"), value: { .string(snapshot.phase.displayName) }),
+                .readOnly("active_job_count", label: NSLocalizedString("命令与浏览器任务", comment: "向导设置字段"), value: { .int(snapshot.activeJobCount) }),
+                .readOnly("active_terminal_count", label: NSLocalizedString("终端", comment: "向导设置字段"), value: { .int(snapshot.activeTerminalCount) }),
+                .readOnly("active_mcp_process_count", label: NSLocalizedString("本地 MCP", comment: "向导设置字段"), value: { .int(snapshot.activeMCPProcessCount) })
+            ]
+        )
         .task {
             snapshot = await LocalLinuxRuntimeController.shared.refreshInstalledState()
             usage = await LocalLinuxStorageManager.shared.storageUsage()
@@ -51,6 +96,7 @@ struct LocalLinuxFeatureView: View {
                 snapshot = update
             }
         }
+        .localLinuxDiagnosticFeedback(priority: 1, blocked: errorMessage != nil || showResetConfirmation)
         .alert(
             NSLocalizedString("本地 Linux 操作失败", comment: "Local Linux operation error title"),
             isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })
@@ -175,7 +221,7 @@ struct LocalLinuxFeatureView: View {
                 }
                 .pickerStyle(.navigationLink)
             } footer: {
-                Text(NSLocalizedString("只列出当前 Linux 系统中已安装的 Shell。新终端会以登录 Shell 启动；Agent 的脚本命令仍固定使用 /bin/sh。", comment: "Default interactive Linux shell footer"))
+                Text(NSLocalizedString("仅影响新终端，Agent 脚本仍使用 /bin/sh。", comment: "默认终端 Shell 页脚"))
             }
 
             Section {
@@ -348,7 +394,7 @@ struct LocalLinuxFeatureView: View {
                     HStack {
                         ProgressView()
                             .controlSize(.small)
-                        Text(NSLocalizedString("正在重置并重新启动 Linux…", comment: "Resetting local Linux status"))
+                        Text(NSLocalizedString("正在重置 Linux…", comment: "正在清除 Linux 系统"))
                     }
                 } else if let resetStatusMessage {
                     Label(resetStatusMessage, systemImage: "checkmark.circle.fill")
@@ -439,9 +485,7 @@ struct LocalLinuxFeatureView: View {
             do {
                 snapshot = try await LocalLinuxRuntimeController.shared.deleteSystem(deleteUserData: deleteUserData)
                 usage = await LocalLinuxStorageManager.shared.storageUsage()
-                resetStatusMessage = appConfig.localLinuxEnabled
-                    ? NSLocalizedString("系统已重置并重新启动。", comment: "Local Linux reset completed")
-                    : NSLocalizedString("系统已重置；下次启用时会重新准备。", comment: "Disabled local Linux reset completed")
+                resetStatusMessage = NSLocalizedString("系统已重置，下次使用时会重新安装内置系统。", comment: "Linux 重置完成")
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -496,6 +540,24 @@ private struct LocalLinuxEnvironmentView: View {
             }
         }
         .navigationTitle(NSLocalizedString("环境变量", comment: "Linux environment title"))
+        .guideSettingsPageContext(
+            id: "settings-local-linux-environment",
+            title: NSLocalizedString("环境变量", comment: "Linux environment guide title"),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .readOnly("variables", label: NSLocalizedString("变量", comment: "向导设置字段"), value: {
+                    .array(variables.map { variable in
+                        .dictionary([
+                            "id": .string(variable.id.uuidString),
+                            "name": .string(variable.name),
+                            "enabled": .bool(variable.isEnabled),
+                            "note": .string(variable.note),
+                            "value": .string(GuideSnapshotField.hiddenValue)
+                        ])
+                    })
+                })
+            ]
+        )
         .task { await reload() }
         .onAppear { Task { await reload() } }
     }
@@ -544,6 +606,20 @@ private struct LocalLinuxEnvironmentEditorView: View {
         .navigationTitle(isNew
             ? NSLocalizedString("添加环境变量", comment: "Add Linux environment variable title")
             : draft.name)
+        .guideSettingsPageContext(
+            id: "settings-local-linux-environment-editor",
+            title: isNew
+                ? NSLocalizedString("添加环境变量", comment: "Add Linux environment variable guide title")
+                : String(format: NSLocalizedString("环境变量：%@", comment: "Linux environment variable guide title"), draft.name),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .string("name", label: NSLocalizedString("名称", comment: "向导设置字段"), allowsEmpty: false, get: { draft.name }, set: { draft.name = $0 }),
+                .writeOnlyString("value", label: NSLocalizedString("值", comment: "向导设置字段"), isConfigured: { !draft.value.isEmpty }, set: { draft.value = $0 }),
+                .string("note", label: NSLocalizedString("备注", comment: "向导设置字段"), get: { draft.note }, set: { draft.note = $0 }),
+                .bool("enabled", label: NSLocalizedString("启用", comment: "向导设置字段"), get: { draft.isEnabled }, set: { draft.isEnabled = $0 }),
+                .readOnly("requires_save", label: NSLocalizedString("应用方式", comment: "向导设置字段"), value: { .string(NSLocalizedString("修改后需要保存", comment: "向导草稿应用方式")) })
+            ]
+        )
         .alert(NSLocalizedString("保存失败", comment: "Save failed"), isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
             Button(NSLocalizedString("好", comment: "Dismiss"), role: .cancel) {}
         } message: { Text(errorMessage ?? "") }
@@ -636,6 +712,28 @@ private struct LocalLinuxSafetyRulesView: View {
             }
         }
         .navigationTitle(NSLocalizedString("安全策略", comment: "Linux safety title"))
+        .guideSettingsPageContext(
+            id: "settings-local-linux-safety",
+            title: NSLocalizedString("命令安全策略", comment: "Linux safety guide title"),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .bool("enabled", label: NSLocalizedString("启用命令安全策略", comment: "向导设置字段"), get: { appConfig.localLinuxCommandSafetyEnabled }, set: { appConfig.localLinuxCommandSafetyEnabled = $0 }),
+                .readOnly("rules", label: NSLocalizedString("规则", comment: "向导设置字段"), value: {
+                    .array(rules.map { rule in
+                        .dictionary([
+                            "id": .string(rule.id.uuidString),
+                            "name": .string(rule.name),
+                            "pattern": .string(rule.pattern),
+                            "match_kind": .string(rule.matchKind.rawValue),
+                            "scope": .string(rule.scope.rawValue),
+                            "action": .string(rule.action.rawValue),
+                            "enabled": .bool(rule.isEnabled),
+                            "priority": .int(rule.sortIndex)
+                        ])
+                    })
+                })
+            ]
+        )
         .toolbar { EditButton() }
         .task { await reload() }
         .onAppear { Task { await reload() } }
@@ -716,6 +814,23 @@ private struct LocalLinuxSafetyRuleEditorView: View {
         .navigationTitle(draft.name.isEmpty
             ? NSLocalizedString("命令规则", comment: "Linux command rule title")
             : draft.name)
+        .guideSettingsPageContext(
+            id: "settings-local-linux-safety-rule-editor",
+            title: draft.name.isEmpty
+                ? NSLocalizedString("命令规则", comment: "Linux command rule guide title")
+                : String(format: NSLocalizedString("命令规则：%@", comment: "Linux command rule guide title"), draft.name),
+            documents: [GuideDocumentReference(id: "local-linux", title: "Local Linux")],
+            settings: [
+                .string("name", label: NSLocalizedString("规则名称", comment: "向导设置字段"), get: { draft.name }, set: { draft.name = $0 }),
+                .string("pattern", label: NSLocalizedString("匹配内容", comment: "向导设置字段"), allowsEmpty: false, get: { draft.pattern }, set: { draft.pattern = $0 }),
+                .string("match_kind", label: NSLocalizedString("匹配方式", comment: "向导设置字段"), allowedValues: LocalLinuxCommandRuleMatchKind.allCases.map(\.rawValue), get: { draft.matchKind.rawValue }, set: { draft.matchKind = LocalLinuxCommandRuleMatchKind(rawValue: $0) ?? draft.matchKind }),
+                .string("scope", label: NSLocalizedString("作用范围", comment: "向导设置字段"), allowedValues: LocalLinuxCommandRuleScope.allCases.map(\.rawValue), get: { draft.scope.rawValue }, set: { draft.scope = LocalLinuxCommandRuleScope(rawValue: $0) ?? draft.scope }),
+                .string("action", label: NSLocalizedString("处理", comment: "向导设置字段"), allowedValues: LocalLinuxCommandRuleAction.allCases.map(\.rawValue), get: { draft.action.rawValue }, set: { draft.action = LocalLinuxCommandRuleAction(rawValue: $0) ?? draft.action }),
+                .bool("enabled", label: NSLocalizedString("启用规则", comment: "向导设置字段"), get: { draft.isEnabled }, set: { draft.isEnabled = $0 }),
+                .integer("priority", label: NSLocalizedString("优先级", comment: "向导设置字段"), range: 0...999, get: { draft.sortIndex }, set: { draft.sortIndex = $0 }),
+                .readOnly("requires_save", label: NSLocalizedString("应用方式", comment: "向导设置字段"), value: { .string(NSLocalizedString("修改后需要保存", comment: "向导草稿应用方式")) })
+            ]
+        )
         .task { validatePattern() }
         .onChange(of: draft.pattern) { _, _ in validatePattern() }
         .onChange(of: draft.matchKind) { _, _ in validatePattern() }
@@ -757,10 +872,10 @@ private struct LocalLinuxSafetyRuleEditorView: View {
 }
 
 private struct LocalLinuxMountsView: View {
+    @ObservedObject private var appConfig = AppConfigStore.shared
     @State private var mounts: [LocalLinuxMountRecord] = []
     @State private var isImporterPresented = false
     @State private var isPreparingMount = false
-    @State private var access = LocalLinuxMountAccess.readOnly
     @State private var errorMessage: String?
 
     var body: some View {
@@ -772,7 +887,18 @@ private struct LocalLinuxMountsView: View {
             }
 
             Section {
-                Picker(NSLocalizedString("新挂载权限", comment: "New Linux mount access"), selection: $access) {
+                SettingsHelpCard(
+                    title: NSLocalizedString("外部文件夹", comment: "外部挂载说明标题"),
+                    summary: NSLocalizedString("让 App 和 AI 访问你选择的文件夹。", comment: "外部挂载说明摘要"),
+                    details: NSLocalizedString("外部目录使用系统授权书签；只读权限会在存储管理和 Linux mount 层执行。iCloud Drive 固定映射到 /mnt/icloud。", comment: "外部挂载使用说明")
+                )
+            }
+
+            Section {
+                Picker(
+                    NSLocalizedString("新挂载权限", comment: "New Linux mount access"),
+                    selection: $appConfig.localLinuxDefaultMountAccess
+                ) {
                     Text(NSLocalizedString("只读", comment: "Read only" )).tag(LocalLinuxMountAccess.readOnly)
                     Text(NSLocalizedString("读写", comment: "Read write")).tag(LocalLinuxMountAccess.readWrite)
                 }
@@ -787,7 +913,7 @@ private struct LocalLinuxMountsView: View {
                     }
                 }
             } footer: {
-                Text(NSLocalizedString("外部目录使用系统授权书签；只读权限会在存储管理和 Linux mount 层执行。iCloud Drive 固定映射到 /mnt/icloud。", comment: "Linux mount behavior footer"))
+                Text(NSLocalizedString("只读可保护原文件；读写操作会直接修改原文件。", comment: "外部挂载权限页脚"))
             }
 
             Section(NSLocalizedString("外部挂载", comment: "External Linux mounts section")) {
@@ -838,7 +964,7 @@ private struct LocalLinuxMountsView: View {
                         _ = try await LocalLinuxMountManager.shared.addExternalDirectory(
                             url,
                             displayName: url.lastPathComponent,
-                            access: access
+                            access: appConfig.localLinuxDefaultMountAccess
                         )
                         await reload()
                     } catch {

@@ -76,13 +76,38 @@ struct SettingsView: View {
     // MARK: - 视图主体
     
     var body: some View {
-        if embedsInNavigationStack {
-            NavigationStack {
+        Group {
+            if embedsInNavigationStack {
+                NavigationStack {
+                    settingsContent
+                }
+            } else {
                 settingsContent
             }
-        } else {
-            settingsContent
         }
+        // 后备上下文覆盖整个设置容器；入口由栈内页面提供，避免与子页工具栏重复。
+        .guidePageContext(
+            descriptor: GuidePageDescriptor(
+                id: "watch-settings-root",
+                title: NSLocalizedString("设置", comment: "手表设置向导上下文标题"),
+                documents: [GuideDocumentReference(id: "guide-overview", title: "Guide Overview")]
+            ),
+            isFallback: true,
+            snapshot: {
+                GuidePageSnapshot(fields: [
+                    "provider_count": GuideSnapshotField(
+                        label: NSLocalizedString("提供商数量", comment: "手表设置向导快照字段"),
+                        value: .int(viewModel.providers.count),
+                        access: .readOnly
+                    ),
+                    "selected_model": GuideSnapshotField(
+                        label: NSLocalizedString("当前模型", comment: "手表设置向导快照字段"),
+                        value: .string(viewModel.selectedModel?.model.displayName ?? ""),
+                        access: .readOnly
+                    )
+                ])
+            }
+        )
     }
 
     private var settingsContent: some View {
@@ -93,6 +118,12 @@ struct SettingsView: View {
                         Text(NSLocalizedString("暂无可用模型，请先在“提供商与模型管理”中启用。", comment: "无可用模型提示"))
                             .etFont(.footnote)
                             .foregroundStyle(.secondary)
+                        NavigationLink {
+                            ProviderListView()
+                                .environmentObject(viewModel)
+                        } label: {
+                            Label(NSLocalizedString("手动配置", comment: "手表首次模型配置手动入口"), systemImage: "slider.horizontal.3")
+                        }
                     } else {
                         NavigationLink {
                             ModelSelectionView(
@@ -159,7 +190,7 @@ struct SettingsView: View {
                             } else {
                                 viewModel.clearPendingMessageJumpTarget()
                             }
-                            ChatService.shared.setCurrentSession(selectedSession)
+                            Task { await ChatService.shared.selectSession(selectedSession) }
                             dismiss()
                         },
                         updateSessionAction: { session in
@@ -256,6 +287,11 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    NavigationLink {
+                        WatchGuideSettingsView()
+                    } label: {
+                        settingsNavigationLabel("页面向导", icon: .guide)
+                    }
                     NavigationLink(destination: AboutView()) {
                         settingsNavigationLabel("关于", icon: .about)
                     }
@@ -293,6 +329,7 @@ struct SettingsView: View {
             .onChange(of: viewModel.activatedModelListVersion) { _, _ in
                 ensureSelectedModel(in: viewModel.activatedConversationModels)
             }
+            .watchGuideEntry()
             .navigationDestination(item: $requestedDestination) { destination in
                 switch destination {
                 case .model:
@@ -488,6 +525,7 @@ struct SettingsView: View {
             enablePeriodicTimeLandmark: $viewModel.enablePeriodicTimeLandmark,
             periodicTimeLandmarkIntervalMinutes: $viewModel.periodicTimeLandmarkIntervalMinutes,
             addGlobalSystemPromptEntry: viewModel.addGlobalSystemPromptEntry,
+            duplicateGlobalSystemPromptEntry: viewModel.duplicateGlobalSystemPromptEntry,
             selectGlobalSystemPromptEntry: viewModel.selectGlobalSystemPromptEntry,
             updateSelectedGlobalSystemPromptContent: viewModel.updateSelectedGlobalSystemPromptContent,
             updateGlobalSystemPromptEntry: viewModel.updateGlobalSystemPromptEntry,
@@ -547,6 +585,7 @@ extension SettingsListIcon {
     static let keyboard = SettingsListIcon(systemName: "keyboard", backgroundColor: .gray)
     static let sync = SettingsListIcon(systemName: "arrow.clockwise", backgroundColor: .green, legacySystemName: "arrow.triangle.2.circlepath")
     static let security = SettingsListIcon(systemName: "lock", backgroundColor: .red)
+    static let guide = SettingsListIcon(systemName: "questionmark.bubble", backgroundColor: .blue)
     static let about = SettingsListIcon(systemName: "info.circle", backgroundColor: .gray)
     static let achievementJournal = SettingsListIcon(systemName: "star", backgroundColor: .yellow, legacySystemName: "rosette")
     static let feedback = SettingsListIcon(systemName: "bubble", backgroundColor: .blue, legacySystemName: "text.bubble")
@@ -789,19 +828,13 @@ private struct ModelSelectionView: View {
     private var quickWorldbookSection: some View {
         Section {
             NavigationLink {
-                WatchWorldbookSessionBindingView(
-                    session: Binding(
-                        get: { viewModel.currentSession },
-                        set: { viewModel.currentSession = $0 }
-                    )
-                )
+                WatchWorldbookSessionBindingView(viewModel: viewModel)
             } label: {
                 Label(
                     NSLocalizedString("世界书", comment: "模型选择器快速世界书入口"),
                     systemImage: "books.vertical"
                 )
             }
-            .disabled(viewModel.currentSession == nil)
         }
     }
 

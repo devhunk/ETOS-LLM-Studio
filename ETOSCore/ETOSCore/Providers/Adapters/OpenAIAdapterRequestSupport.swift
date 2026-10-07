@@ -52,6 +52,8 @@ extension OpenAIAdapter {
         fileAttachments: [UUID: [FileAttachment]]
     ) -> URLRequest? {
         let reasoningContentEchoMode = Self.reasoningContentEchoMode(from: commonPayload)
+        let assistantPrefillMessageID = commonPayload[Self.assistantPrefillMessageIDControlKey] as? String
+        let suppressesRequestLog = boolValue(from: commonPayload[requestLogSuppressionControlKey]) ?? false
         guard let baseURL = URL(string: model.provider.baseURL) else {
             logger.error("构建聊天请求失败: 无效的 API 基础 URL - \(model.provider.baseURL)")
             return nil
@@ -67,7 +69,7 @@ extension OpenAIAdapter {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        guard let randomApiKey = model.provider.apiKeys.randomElement(), !randomApiKey.isEmpty else {
+        guard let randomApiKey = commonPayload[providerAPIKeyControlKey] as? String ?? model.provider.nextAPIKey(), !randomApiKey.isEmpty else {
             logger.error("构建聊天请求失败: 提供商 '\(model.provider.name)' 未配置有效的 API Key。")
             return nil
         }
@@ -135,10 +137,12 @@ extension OpenAIAdapter {
                 dict["content"] = msg.content
             }
 
+            // 续写前缀属于当前未完成的回答，必须携带原推理；其他历史消息仍遵循用户设置。
             if msg.role == .assistant,
                let reasoningContent = msg.reasoningContent,
                !reasoningContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               Self.shouldEchoReasoningContent(for: msg, mode: reasoningContentEchoMode) {
+               (msg.id.uuidString == assistantPrefillMessageID
+                || Self.shouldEchoReasoningContent(for: msg, mode: reasoningContentEchoMode)) {
                 dict["reasoning_content"] = reasoningContent
             }
 
@@ -176,8 +180,12 @@ extension OpenAIAdapter {
         let shouldIncludeUsageInStream = boolValue(from: commonPayload[Self.streamIncludeUsageControlKey]) ?? true
 
         var finalPayload = mergedRequestPayload(commonPayload, with: overrides)
+        finalPayload.removeValue(forKey: providerAPIKeyControlKey)
         finalPayload.removeValue(forKey: Self.streamIncludeUsageControlKey)
         finalPayload.removeValue(forKey: Self.reasoningContentEchoModeControlKey)
+        finalPayload.removeValue(forKey: Self.assistantPrefillMessageIDControlKey)
+        finalPayload.removeValue(forKey: Self.responsesForceFullInputControlKey)
+        finalPayload.removeValue(forKey: requestLogSuppressionControlKey)
         finalPayload["model"] = resolvedRequestModelName(for: model, overrides: overrides)
         finalPayload["messages"] = apiMessages
 
@@ -217,7 +225,9 @@ extension OpenAIAdapter {
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: finalPayload, options: [.sortedKeys])
             logger.debug("已构建聊天请求体，共 \(request.httpBody?.count ?? 0) 字节。")
-            logChatRequestSnapshot(adapterName: "OpenAI兼容", request: request, payload: finalPayload)
+            if !suppressesRequestLog {
+                logChatRequestSnapshot(adapterName: "OpenAI兼容", request: request, payload: finalPayload)
+            }
         } catch {
             logger.error("构建聊天请求失败: JSON 序列化错误 - \(error.localizedDescription)")
             return nil
@@ -237,6 +247,7 @@ extension OpenAIAdapter {
         fileAttachments: [UUID: [FileAttachment]]
     ) -> URLRequest? {
         let reasoningContentEchoMode = Self.reasoningContentEchoMode(from: commonPayload)
+        let suppressesRequestLog = boolValue(from: commonPayload[requestLogSuppressionControlKey]) ?? false
         if !audioAttachments.isEmpty {
             logger.error("构建 Responses 请求失败: OpenAI Responses API 暂不支持音频附件。")
             return nil
@@ -253,7 +264,7 @@ extension OpenAIAdapter {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        guard let randomApiKey = model.provider.apiKeys.randomElement(), !randomApiKey.isEmpty else {
+        guard let randomApiKey = commonPayload[providerAPIKeyControlKey] as? String ?? model.provider.nextAPIKey(), !randomApiKey.isEmpty else {
             logger.error("构建 Responses 请求失败: 提供商 '\(model.provider.name)' 未配置有效的 API Key。")
             return nil
         }
@@ -272,9 +283,12 @@ extension OpenAIAdapter {
             ?? boolValue(from: overrides[Self.responsesForceFullInputControlKey])
             ?? false
         var finalPayload = mergedRequestPayload(commonPayload, with: overrides)
+        finalPayload.removeValue(forKey: providerAPIKeyControlKey)
         finalPayload.removeValue(forKey: Self.streamIncludeUsageControlKey)
         finalPayload.removeValue(forKey: Self.reasoningContentEchoModeControlKey)
         finalPayload.removeValue(forKey: Self.responsesForceFullInputControlKey)
+        finalPayload.removeValue(forKey: Self.assistantPrefillMessageIDControlKey)
+        finalPayload.removeValue(forKey: requestLogSuppressionControlKey)
         finalPayload["model"] = resolvedRequestModelName(for: model, overrides: overrides)
         finalPayload["input"] = inputAssembly.items
         if forceFullInput {
@@ -373,7 +387,9 @@ extension OpenAIAdapter {
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: finalPayload, options: [.sortedKeys])
             logger.debug("已构建 Responses 请求体，共 \(request.httpBody?.count ?? 0) 字节。")
-            logChatRequestSnapshot(adapterName: "OpenAI兼容 (Responses)", request: request, payload: finalPayload)
+            if !suppressesRequestLog {
+                logChatRequestSnapshot(adapterName: "OpenAI兼容 (Responses)", request: request, payload: finalPayload)
+            }
         } catch {
             logger.error("构建 Responses 请求失败: JSON 序列化错误 - \(error.localizedDescription)")
             return nil
@@ -393,7 +409,7 @@ extension OpenAIAdapter {
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
-        guard let randomApiKey = provider.apiKeys.randomElement(), !randomApiKey.isEmpty else {
+        guard let randomApiKey = provider.nextAPIKey(), !randomApiKey.isEmpty else {
             logger.error("构建模型列表请求失败: 提供商 '\(provider.name)' 未配置有效的 API Key。")
             return nil
         }
@@ -541,7 +557,7 @@ extension OpenAIAdapter {
             overrides: model.effectiveOverrideParameters.mapValues { $0.toAny() }
         )
         
-        guard let apiKey = model.provider.apiKeys.randomElement(), !apiKey.isEmpty else {
+        guard let apiKey = model.provider.nextAPIKey(), !apiKey.isEmpty else {
             logger.error("构建语音转文字请求失败: 提供商 '\(model.provider.name)' 缺少有效的 API Key")
             return nil
         }
@@ -590,7 +606,7 @@ extension OpenAIAdapter {
             overrides: model.effectiveOverrideParameters.mapValues { $0.toAny() }
         )
         
-        guard let apiKey = model.provider.apiKeys.randomElement(), !apiKey.isEmpty else {
+        guard let apiKey = model.provider.nextAPIKey(), !apiKey.isEmpty else {
             logger.error("构建嵌入请求失败: 提供商 '\(model.provider.name)' 缺少有效的 API Key")
             return nil
         }
@@ -636,7 +652,7 @@ extension OpenAIAdapter {
             return nil
         }
 
-        guard let apiKey = model.provider.apiKeys.randomElement(), !apiKey.isEmpty else {
+        guard let apiKey = model.provider.nextAPIKey(), !apiKey.isEmpty else {
             logger.error("构建生图请求失败: 提供商 '\(model.provider.name)' 缺少有效的 API Key")
             return nil
         }

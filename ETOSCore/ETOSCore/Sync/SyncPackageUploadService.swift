@@ -172,7 +172,7 @@ public enum SyncPackageUploadService {
         let sender = transport ?? { request, body in
             var req = request
             req.httpBody = body
-            return try await NetworkSessionConfiguration.shared.data(for: req)
+            return try await NetworkSessionConfiguration.shared.securedData(for: req)
         }
         let (responseData, response) = try await sender(request, exportData)
 
@@ -302,10 +302,12 @@ public enum SyncPackageUploadService {
         timeout: TimeInterval = 30,
         now: Date = Date(),
         transport: FileTransport? = nil,
-        progress: ProgressHandler? = nil
+        progress: ProgressHandler? = nil,
+        diagnostics: SnapshotDiagnostics? = nil
     ) async throws -> SyncPackageUploadResult {
         let fileName = suggestedFileName ?? fileURL.lastPathComponent
         reportInitialProgress(for: fileURL, progress: progress)
+        diagnostics?.record("upload.sign.begin", fileURL: fileURL)
         let request = try makeS3UploadRequest(
             fileURL: fileURL,
             suggestedFileName: fileName.isEmpty ? "ETOS-Snapshot.\(SnapshotBuilder.fileExtension)" : fileName,
@@ -313,6 +315,7 @@ public enum SyncPackageUploadService {
             timeout: timeout,
             now: now
         )
+        diagnostics?.record("upload.request.begin", fileURL: fileURL)
 
         let sender = transport ?? { request, fileURL in
             try await uploadFile(request: request, fileURL: fileURL, progress: progress)
@@ -327,6 +330,7 @@ public enum SyncPackageUploadService {
             throw SyncPackageUploadError.unexpectedStatusCode(httpResponse.statusCode, preview)
         }
         reportCompletedProgress(for: fileURL, progress: progress)
+        diagnostics?.record("upload.completed", details: ["httpStatus": String(httpResponse.statusCode)])
 
         return SyncPackageUploadResult(
             statusCode: httpResponse.statusCode,
@@ -346,7 +350,7 @@ public enum SyncPackageUploadService {
             now: now
         )
         let sender = transport ?? { request in
-            try await NetworkSessionConfiguration.shared.data(for: request)
+            try await NetworkSessionConfiguration.shared.securedData(for: request)
         }
         let (responseData, response) = try await sender(request)
 
@@ -810,9 +814,14 @@ private extension SyncPackageUploadService {
             defer { try? handle.close() }
             var hasher = SHA256()
             while true {
-                let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
-                if chunk.isEmpty { break }
-                hasher.update(data: chunk)
+                // 每块读取结束就释放 Foundation 临时对象，避免长任务延迟回收整文件的读取缓冲。
+                let hasMoreData = try autoreleasepool {
+                    let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
+                    guard !chunk.isEmpty else { return false }
+                    hasher.update(data: chunk)
+                    return true
+                }
+                if !hasMoreData { break }
             }
             return hexString(Data(hasher.finalize()))
         } catch {
@@ -921,7 +930,7 @@ private extension SyncPackageUploadService {
     }
 }
 
-private final class UploadProgressDelegate: NSObject, URLSessionDataDelegate {
+private final class UploadProgressDelegate: NetworkSecuritySessionDelegate, URLSessionDataDelegate, @unchecked Sendable {
     private let totalBytes: Int64
     private let progress: SyncPackageUploadService.ProgressHandler?
     private let lock = NSLock()
@@ -935,19 +944,30 @@ private final class UploadProgressDelegate: NSObject, URLSessionDataDelegate {
     }
 
     func upload(request: URLRequest, fileURL: URL) async throws -> (Data, URLResponse) {
-        try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            self.continuation = continuation
-            let session = URLSession(
-                configuration: NetworkSessionConfiguration.makeConfiguration(),
-                delegate: self,
-                delegateQueue: nil
-            )
-            self.session = session
-            lock.unlock()
+        try await NetworkConnectionSecurity.shared.authorizeHTTP(request.url)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                guard !Task.isCancelled else {
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                let session = URLSession(configuration: NetworkSessionConfiguration.makeConfiguration(), delegate: self, delegateQueue: nil)
+                self.session = session
+                NetworkSessionConfiguration.track(session)
+                session.uploadTask(with: request, fromFile: fileURL).resume()
+                lock.unlock()
+            }
+        } onCancel: { [weak self] in self?.cancelTransfer() }
+    }
 
-            session.uploadTask(with: request, fromFile: fileURL).resume()
-        }
+    private func cancelTransfer() {
+        lock.lock()
+        let session = session
+        lock.unlock()
+        session?.invalidateAndCancel()
     }
 
     func urlSession(
@@ -965,7 +985,8 @@ private final class UploadProgressDelegate: NSObject, URLSessionDataDelegate {
         responseData.append(data)
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    override func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        super.urlSession(session, task: task, didCompleteWithError: error)
         if let error {
             finish(.failure(error))
             return
@@ -999,7 +1020,7 @@ private final class UploadProgressDelegate: NSObject, URLSessionDataDelegate {
     }
 }
 
-private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+private final class DownloadProgressDelegate: NetworkSecuritySessionDelegate, URLSessionDownloadDelegate, @unchecked Sendable {
     private let progress: SyncPackageUploadService.DownloadProgressHandler?
     private let lock = NSLock()
     private var session: URLSession?
@@ -1011,19 +1032,30 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelega
     }
 
     func download(request: URLRequest) async throws -> (URL, URLResponse) {
-        try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            self.continuation = continuation
-            let session = URLSession(
-                configuration: NetworkSessionConfiguration.makeConfiguration(),
-                delegate: self,
-                delegateQueue: nil
-            )
-            self.session = session
-            lock.unlock()
+        try await NetworkConnectionSecurity.shared.authorizeHTTP(request.url)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                guard !Task.isCancelled else {
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                let session = URLSession(configuration: NetworkSessionConfiguration.makeConfiguration(), delegate: self, delegateQueue: nil)
+                self.session = session
+                NetworkSessionConfiguration.track(session)
+                session.downloadTask(with: request).resume()
+                lock.unlock()
+            }
+        } onCancel: { [weak self] in self?.cancelTransfer() }
+    }
 
-            session.downloadTask(with: request).resume()
-        }
+    private func cancelTransfer() {
+        lock.lock()
+        let session = session
+        lock.unlock()
+        session?.invalidateAndCancel()
     }
 
     func urlSession(
@@ -1054,7 +1086,8 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelega
         }
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    override func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        super.urlSession(session, task: task, didCompleteWithError: error)
         if let error {
             finish(.failure(error))
             return

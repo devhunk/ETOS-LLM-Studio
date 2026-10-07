@@ -16,13 +16,17 @@ struct MessageActionsView: View {
     // MARK: - 属性与操作
     
     let message: ChatMessage
+    let isUserContentTruncated: Bool
+    let responseAttemptVersionInfo: ChatResponseAttemptVersionInfo?
     let canRetry: Bool
+    let canPrefill: Bool
     let canRewrite: Bool
     let onInsertText: (String) -> Void
     let onEdit: () -> Void
     let onRewrite: () -> Void
     let onRewriteSelection: (MessageRewriteSelectionTarget) -> Void
     let onRetry: (ChatMessage) -> Void
+    let onPrefill: (ChatMessage) -> Void
     let onRetryVideoAnalysis: (ChatMessage, String) async throws -> VideoAnalysisResult
     let onSpeak: (ChatMessage) -> Void
     let onStopSpeaking: () -> Void
@@ -46,13 +50,17 @@ struct MessageActionsView: View {
 
     init(
         message: ChatMessage,
+        isUserContentTruncated: Bool,
+        responseAttemptVersionInfo: ChatResponseAttemptVersionInfo?,
         canRetry: Bool,
+        canPrefill: Bool,
         canRewrite: Bool,
         onInsertText: @escaping (String) -> Void,
         onEdit: @escaping () -> Void,
         onRewrite: @escaping () -> Void,
         onRewriteSelection: @escaping (MessageRewriteSelectionTarget) -> Void,
         onRetry: @escaping (ChatMessage) -> Void,
+        onPrefill: @escaping (ChatMessage) -> Void,
         onRetryVideoAnalysis: @escaping (ChatMessage, String) async throws -> VideoAnalysisResult,
         onSpeak: @escaping (ChatMessage) -> Void,
         onStopSpeaking: @escaping () -> Void,
@@ -74,13 +82,17 @@ struct MessageActionsView: View {
         totalMessages: Int
     ) {
         self.message = message
+        self.isUserContentTruncated = isUserContentTruncated
+        self.responseAttemptVersionInfo = responseAttemptVersionInfo
         self.canRetry = canRetry
+        self.canPrefill = canPrefill
         self.canRewrite = canRewrite
         self.onInsertText = onInsertText
         self.onEdit = onEdit
         self.onRewrite = onRewrite
         self.onRewriteSelection = onRewriteSelection
         self.onRetry = onRetry
+        self.onPrefill = onPrefill
         self.onRetryVideoAnalysis = onRetryVideoAnalysis
         self.onSpeak = onSpeak
         self.onStopSpeaking = onStopSpeaking
@@ -109,19 +121,17 @@ struct MessageActionsView: View {
     @State private var showBranchOptions = false
     @State private var versionIndexToDelete: Int?
     @State private var pendingRetryMessage: ChatMessage?
+    @State private var pendingPrefill = false
     @State private var jumpInput: String = ""
     @State private var jumpError: String?
     @State private var mathHTMLPageItem: WatchWebHTMLPageItem?
     @State private var videoAnalysisOverrides: [String: VideoAnalysisResult] = [:]
     @State private var retryingVideoFileNames: Set<String> = []
     @State private var videoAnalysisError: String?
+    @State private var inlineContents: [InlineHTMLContent] = []
     @ObservedObject private var appConfig = AppConfigStore.shared
     @ObservedObject private var ttsManager = TTSManager.shared
     @Environment(\.colorScheme) private var colorScheme
-
-    private var responseAttemptVersionInfo: ChatResponseAttemptVersionInfo? {
-        ChatResponseAttemptSupport.versionInfo(for: message, in: allMessages)
-    }
 
     private var hasDisplayVersions: Bool {
         responseAttemptVersionInfo != nil || message.hasMultipleVersions
@@ -155,6 +165,37 @@ struct MessageActionsView: View {
         
         Form {
             Section {
+                if !inlineContents.isEmpty {
+                    NavigationLink {
+                        if inlineContents.count == 1, let content = inlineContents.first {
+                            WatchInlineHTMLActionsPage(content: content, onCopy: onInsertText)
+                        } else {
+                        List(inlineContents) { content in
+                            NavigationLink(content.title) {
+                                WatchInlineHTMLActionsPage(content: content, onCopy: onInsertText)
+                            }
+                        }
+                        .navigationTitle(NSLocalizedString("内联内容", comment: ""))
+                        .guideSettingsPageContext(
+                            id: GuidePageID(rawValue: "inline-html-list-\(message.id)"),
+                            title: NSLocalizedString("内联内容", comment: ""),
+                            documents: [GuideDocumentReference(id: "inline-html-actions", title: NSLocalizedString("内联内容", comment: ""))],
+                            settings: [.readOnly("count", label: NSLocalizedString("内联内容", comment: ""), value: { .int(inlineContents.count) })]
+                        )
+                        .watchGuideEntry()
+                        }
+                    } label: {
+                        Label(NSLocalizedString("内联内容", comment: ""), systemImage: "curlybraces.square")
+                    }
+                }
+                if message.role == .user, isUserContentTruncated {
+                    NavigationLink {
+                        FullMessageContentView(content: message.content)
+                    } label: {
+                        Label(NSLocalizedString("查看完整内容", comment: ""), systemImage: "doc.text.magnifyingglass")
+                    }
+                }
+
                 if !hasAttachments {
                     Button {
                         onEdit()
@@ -170,6 +211,15 @@ struct MessageActionsView: View {
                         dismiss()
                     } label: {
                         Label(NSLocalizedString("重试", comment: ""), systemImage: "arrow.clockwise")
+                    }
+                    if canPrefill && message.canPrefill {
+                        Button {
+                            pendingPrefill = true
+                            pendingRetryMessage = message
+                            dismiss()
+                        } label: {
+                            Label(NSLocalizedString("预填充续写", comment: ""), systemImage: "text.append")
+                        }
                     }
                 }
                 
@@ -469,6 +519,9 @@ struct MessageActionsView: View {
             }
         }
         .navigationTitle(NSLocalizedString("操作", comment: ""))
+        .task(id: message.id) {
+            inlineContents = InlineHTMLContentRegistry.shared.contents(messageID: message.id, versionIndex: message.getCurrentVersionIndex())
+        }
         .navigationBarTitleDisplayMode(.inline)
         .alert(NSLocalizedString("确认删除消息", comment: ""), isPresented: $showDeleteConfirm) {
             Button(NSLocalizedString("删除", comment: ""), role: .destructive) {
@@ -649,10 +702,16 @@ struct MessageActionsView: View {
 
     private func performPendingRetryIfNeeded() {
         guard let message = pendingRetryMessage else { return }
+        let isPrefill = pendingPrefill
         pendingRetryMessage = nil
+        pendingPrefill = false
         Task { @MainActor in
             await Task.yield()
-            onRetry(message)
+            if isPrefill {
+                onPrefill(message)
+            } else {
+                onRetry(message)
+            }
         }
     }
 }

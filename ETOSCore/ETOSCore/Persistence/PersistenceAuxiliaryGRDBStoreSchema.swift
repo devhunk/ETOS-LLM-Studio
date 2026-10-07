@@ -948,6 +948,28 @@ extension PersistenceAuxiliaryGRDBStore {
             migrator.registerMigration("v20_add_local_linux_command_rule_suffix") { db in
                 try Self.migrateLocalLinuxCommandRuleSuffix(db)
             }
+
+            migrator.registerMigration("v21_add_feedback_referenced_commit_tracking") { db in
+                try db.alter(table: "feedback_tickets") { table in
+                    table.add(column: "last_known_referenced_commit_ids", .text)
+                }
+            }
+        }
+
+        if supportsConfigRelationalSchema {
+            migrator.registerMigration("v22_add_provider_model_prompt") { db in
+                try db.execute(sql: "ALTER TABLE provider_models ADD COLUMN prompt TEXT NOT NULL DEFAULT ''")
+            }
+            migrator.registerMigration("v23_add_provider_multi_key_configuration") { db in
+                try db.execute(sql: "ALTER TABLE providers ADD COLUMN multi_key_enabled BOOLEAN NOT NULL DEFAULT 0")
+                try db.execute(sql: "ALTER TABLE providers ADD COLUMN maximum_key_retries INTEGER NOT NULL DEFAULT 3")
+                try db.execute(sql: "ALTER TABLE provider_api_keys ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+                // 已有多凭据配置继续使用全部密钥，升级不能悄悄禁用其他凭据。
+                try db.execute(sql: """
+                    UPDATE providers SET multi_key_enabled = 1
+                    WHERE (SELECT COUNT(*) FROM provider_api_keys WHERE provider_id = providers.id) > 1
+                    """)
+            }
         }
 
         if supportsMemoryRelationalSchema {

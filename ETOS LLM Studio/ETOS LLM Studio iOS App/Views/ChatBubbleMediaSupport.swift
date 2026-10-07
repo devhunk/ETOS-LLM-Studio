@@ -15,18 +15,55 @@ import ImageIO
 struct ImagePreviewPayload: Identifiable {
     let id = UUID()
     let image: UIImage
+    var fileName: String? = nil
+}
+
+struct ChatAttachmentImageSourceModifier: ViewModifier {
+    let sourceID: String
+    let namespace: Namespace.ID
+    let cornerRadius: CGFloat
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *), !reduceMotion {
+            content.matchedTransitionSource(id: sourceID, in: namespace) { configuration in
+                configuration.clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            }
+        } else {
+            content
+        }
+    }
+}
+
+struct ChatAttachmentImagePreviewTransition: ViewModifier {
+    let sourceID: String?
+    let namespace: Namespace.ID
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *), !reduceMotion, let sourceID {
+            // 系统在返回时重新定位来源，滚动、旋转或交互式取消都无需保存过期的屏幕矩形。
+            content.navigationTransition(.zoom(sourceID: sourceID, in: namespace))
+        } else {
+            content
+        }
+    }
 }
 
 struct ChatAttachmentImagePreview: View {
     let payload: ImagePreviewPayload
 
     @Environment(\.dismiss) private var dismiss
+    @State private var originalImage: UIImage?
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
 
-            ZoomableUIImageScrollView(image: payload.image)
+            ZoomableUIImageScrollView(image: originalImage ?? payload.image)
+                .id(payload.id)
                 .ignoresSafeArea()
 
             Button {
@@ -45,6 +82,13 @@ struct ChatAttachmentImagePreview: View {
         }
         .background(Color.black.ignoresSafeArea())
         .statusBarHidden()
+        .task(id: payload.id) {
+            originalImage = nil
+            guard let fileName = payload.fileName else { return }
+            let image = await DisplayImageLoader.shared.originalAttachment(named: fileName)
+            guard !Task.isCancelled else { return }
+            originalImage = image
+        }
     }
 }
 
@@ -60,12 +104,12 @@ private struct ZoomableUIImageScrollView: UIViewRepresentable {
     }
 }
 
-private final class ZoomableUIImageScrollContainerView: UIView, UIScrollViewDelegate {
+final class ZoomableUIImageScrollContainerView: UIView, UIScrollViewDelegate {
     var image: UIImage {
         didSet {
             guard oldValue !== image else { return }
             imageView.image = image
-            needsZoomReset = true
+            // 缩略图升级为原图时保留用户已经开始的缩放和拖动。
             setNeedsLayout()
         }
     }
@@ -136,6 +180,8 @@ private final class ZoomableUIImageScrollContainerView: UIView, UIScrollViewDele
             height: image.size.height * fitScale
         )
         let previousZoomScale = scrollView.zoomScale
+        let previousOffset = scrollView.contentOffset
+        let preservesPosition = !needsZoomReset
         let shouldReframe = fittedImageSize != targetSize || needsZoomReset
         guard shouldReframe else {
             centerImage()
@@ -153,6 +199,13 @@ private final class ZoomableUIImageScrollContainerView: UIView, UIScrollViewDele
             scrollView.setZoomScale(min(max(previousZoomScale, 1), scrollView.maximumZoomScale), animated: false)
         }
         centerImage()
+        if preservesPosition {
+            let inset = scrollView.contentInset
+            scrollView.contentOffset = CGPoint(
+                x: min(max(previousOffset.x, -inset.left), max(-inset.left, scrollView.contentSize.width - bounds.width + inset.right)),
+                y: min(max(previousOffset.y, -inset.top), max(-inset.top, scrollView.contentSize.height - bounds.height + inset.bottom))
+            )
+        }
     }
 
     private func centerImage() {
@@ -190,21 +243,6 @@ private final class ZoomableUIImageScrollContainerView: UIView, UIScrollViewDele
 }
 
 enum ChatAttachmentImageCache {
-    private static let cache: NSCache<NSString, UIImage> = {
-        let cache = NSCache<NSString, UIImage>()
-        cache.countLimit = 160
-        return cache
-    }()
-
-    static func image(for fileName: String) -> UIImage? {
-        cache.object(forKey: fileName as NSString)
-    }
-
-    static func store(_ image: UIImage, for fileName: String) {
-        let pixelCost = Int(image.size.width * image.size.height * image.scale * image.scale)
-        cache.setObject(image, forKey: fileName as NSString, cost: max(1, pixelCost))
-    }
-
     /// 离屏导出只保留展示尺寸缩略图，避免原图与长图位图叠加占用内存。
     static func preload(fileNames: [String]) async throws -> ChatAttachmentImagePreloadResult {
         let uniqueFileNames = Array(Set(fileNames))
@@ -292,6 +330,7 @@ struct AttachmentImageView: View {
     let maxWidth: CGFloat
     let height: CGFloat
     let cornerRadius: CGFloat
+    let onOpenMessageActions: (() -> Void)?
     let onPreview: (UIImage) -> Void
     let onDownload: (() -> Void)?
     let onDelete: (() -> Void)?
@@ -302,6 +341,7 @@ struct AttachmentImageView: View {
         maxWidth: CGFloat,
         height: CGFloat,
         cornerRadius: CGFloat,
+        onOpenMessageActions: (() -> Void)? = nil,
         onPreview: @escaping (UIImage) -> Void,
         onDownload: (() -> Void)? = nil,
         onDelete: (() -> Void)? = nil
@@ -311,18 +351,25 @@ struct AttachmentImageView: View {
         self.maxWidth = maxWidth
         self.height = height
         self.cornerRadius = cornerRadius
+        self.onOpenMessageActions = onOpenMessageActions
         self.onPreview = onPreview
         self.onDownload = onDownload
         self.onDelete = onDelete
     }
 
     @Environment(\.chatTranscriptPreloadedAttachmentImages) private var preloadedImages
+    @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
-    @State private var didAttemptLoad = false
+    @State private var loadedFileName: String?
+    @State private var displaySize: CGSize = .zero
     @State private var showsDeleteConfirmation = false
 
     private var displayedImage: UIImage? {
-        preloadedImages[fileName] ?? image ?? ChatAttachmentImageCache.image(for: fileName)
+        preloadedImages[fileName] ?? (loadedFileName == fileName ? image : nil)
+    }
+
+    private var imageTarget: DisplayImageTarget {
+        DisplayImageTarget(size: displaySize, scale: displayScale)
     }
 
     var body: some View {
@@ -340,6 +387,7 @@ struct AttachmentImageView: View {
                         .shadow(color: Color.black.opacity(0.12), radius: 4, y: 2)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(NSLocalizedString("图片预览", comment: ""))
             } else {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .fill(Color.secondary.opacity(0.15))
@@ -358,13 +406,17 @@ struct AttachmentImageView: View {
                     .shadow(color: Color.black.opacity(0.08), radius: 3, y: 1)
             }
         }
-        .task(id: fileName) {
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { displaySize = $0 }
+        .task(id: "\(fileName)|\(imageTarget.width)x\(imageTarget.height)") {
             guard preloadedImages[fileName] == nil else { return }
-            guard !didAttemptLoad else { return }
-            didAttemptLoad = true
             await loadImage()
         }
         .contextMenu {
+            if let onOpenMessageActions {
+                Button(action: onOpenMessageActions) {
+                    Label(NSLocalizedString("消息操作", comment: ""), systemImage: "ellipsis")
+                }
+            }
             if let onDownload {
                 Button(action: onDownload) {
                     Label(
@@ -397,27 +449,10 @@ struct AttachmentImageView: View {
     }
 
     private func loadImage() async {
-        if let cached = ChatAttachmentImageCache.image(for: fileName) {
-            await MainActor.run {
-                image = cached
-            }
-            return
-        }
-
-        let loadTask = Task.detached(priority: .userInitiated) { () -> UIImage? in
-            let fileURL = Persistence.getImageDirectory().appendingPathComponent(fileName)
-            if let image = UIImage(contentsOfFile: fileURL.path) {
-                return image
-            }
-            guard let data = Persistence.loadImage(fileName: fileName) else { return nil }
-            return UIImage(data: data)
-        }
-        let loadedImage = await loadTask.value
-
-        guard let loadedImage else { return }
-        ChatAttachmentImageCache.store(loadedImage, for: fileName)
-        await MainActor.run {
-            image = loadedImage
-        }
+        guard !imageTarget.isEmpty else { return }
+        let prepared = await DisplayImageLoader.shared.attachment(named: fileName, target: imageTarget)
+        guard !Task.isCancelled else { return }
+        image = prepared?.image
+        loadedFileName = fileName
     }
 }

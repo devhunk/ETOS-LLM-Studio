@@ -14,6 +14,7 @@ public final class ChatMessageRenderState: ObservableObject, Identifiable {
     public let id: UUID
     public private(set) var message: ChatMessage
     @Published public private(set) var visualMessage: ChatMessage
+    public private(set) var isUserContentTruncated = false
     @Published public private(set) var roleplayHTML: RoleplayHTMLExtraction?
     public private(set) var layoutRevision: UInt = 0
     public private(set) var rendererHandoffRevision: UInt = 0
@@ -21,19 +22,41 @@ public final class ChatMessageRenderState: ObservableObject, Identifiable {
     /// 流式气泡一旦占用稳定宽度便不再释放，直到该消息的渲染状态被销毁。
     public private(set) var retainsStreamingAssistantWidth: Bool
     public let streamingMarkdownState: ETStreamingMarkdownRenderState
+    @Published private var toolCallDisplayTitles: [String: String] = [:]
+    private(set) var toolCallTitlePreparationTask: Task<Void, Never>?
     
-    public init(message: ChatMessage) {
+    public init(message: ChatMessage, userContentPreview: ChatUserMessagePreview? = nil) {
         self.id = message.id
         self.message = message
-        self.visualMessage = message
+        var initialVisualMessage = message
+        // 列表快照在后台带回预览，首帧即可展示正文；导出不传预览，仍然保留全文。
+        if message.role == .user, let userContentPreview {
+            initialVisualMessage.content = userContentPreview.content
+            self.isUserContentTruncated = userContentPreview.isTruncated
+        }
+        self.visualMessage = initialVisualMessage
         self.roleplayHTML = nil
         self.lastRendererHandoffAt = nil
         self.retainsStreamingAssistantWidth = Self.isAssistantLoadingPlaceholder(message)
         self.streamingMarkdownState = ETStreamingMarkdownRenderState()
+        prepareToolCallDisplayTitles()
+    }
+
+    deinit {
+        toolCallTitlePreparationTask?.cancel()
     }
     
     public func update(with message: ChatMessage) {
         guard self.message != message else { return }
+        if self.message.isReceivingStream, !message.isReceivingStream, message.role == .assistant {
+            // 真正接收流的消息结束时保留最后一帧，直到后台静态 Markdown 准备完毕。
+            if streamingMarkdownState.contentSnapshot != nil {
+                streamingMarkdownState.beginStaticHandoff(channel: .content)
+            }
+            if streamingMarkdownState.reasoningSnapshot != nil {
+                streamingMarkdownState.beginStaticHandoff(channel: .reasoning)
+            }
+        }
         objectWillChange.send()
         self.message = message
         layoutRevision &+= 1
@@ -45,10 +68,42 @@ public final class ChatMessageRenderState: ObservableObject, Identifiable {
         self.message = message
     }
 
-    public func updateVisualMessage(_ message: ChatMessage) {
-        guard visualMessage != message else { return }
+    public func updateVisualMessage(_ message: ChatMessage, isUserContentTruncated: Bool = false) {
+        guard visualMessage != message || self.isUserContentTruncated != isUserContentTruncated else { return }
+        // 执行状态和结果变化不影响任务标题，避免完成一次调用后再次解析参数。
+        let hasUpdatedToolArguments = !(visualMessage.toolCalls ?? []).elementsEqual(message.toolCalls ?? []) {
+            $0.id == $1.id && $0.toolName == $1.toolName && $0.arguments == $1.arguments
+        }
         layoutRevision &+= 1
+        self.isUserContentTruncated = isUserContentTruncated
         visualMessage = message
+        if hasUpdatedToolArguments {
+            prepareToolCallDisplayTitles()
+        }
+    }
+
+    public func toolCallDisplayTitle(for toolCallID: String, isEnabled: Bool) -> String? {
+        isEnabled ? toolCallDisplayTitles[toolCallID] : nil
+    }
+
+    private func prepareToolCallDisplayTitles() {
+        toolCallTitlePreparationTask?.cancel()
+        toolCallDisplayTitles = [:]
+        guard let toolCalls = visualMessage.toolCalls, !toolCalls.isEmpty else { return }
+
+        // 参数可能包含很长的脚本；双端气泡只读取预计算标题，不在渲染时解析 JSON。
+        toolCallTitlePreparationTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let titles = toolCalls.reduce(into: [String: String]()) { titles, call in
+                guard !Task.isCancelled, MCPManager.isMCPToolName(call.toolName) else { return }
+                titles[call.id] = MCPToolCallTitleMetadata.parse(argumentsJSON: call.arguments).title
+            }
+            await MainActor.run { [weak self] in
+                // 切换消息版本后，旧参数的解析结果不能覆盖新版本的显示状态。
+                guard !Task.isCancelled, let self, self.toolCallDisplayTitles != titles else { return }
+                self.layoutRevision &+= 1
+                self.toolCallDisplayTitles = titles
+            }
+        }
     }
 
     public func updateRoleplayHTML(_ extraction: RoleplayHTMLExtraction?) {

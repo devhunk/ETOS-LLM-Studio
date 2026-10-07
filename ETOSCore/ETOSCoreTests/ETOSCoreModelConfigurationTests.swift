@@ -13,9 +13,11 @@ import SwiftUI
 
 @Suite("模型用途配置")
 struct ModelKindConfigurationTests {
-    @Test("普通模型只提供聊天、图片生成和嵌入三种用途")
-    func exposesOnlyPrimaryModelKinds() {
+    @Test("通用模型配置只提供聊天、图片生成和嵌入用途")
+    func exposesConfigurableModelKinds() {
         #expect(ModelKind.allCases == [.chat, .image, .embedding])
+        #expect(ModelKind.chat.supportsConnectivityTest)
+        #expect(!ModelKind.textToSpeech.supportsConnectivityTest)
     }
 }
 
@@ -641,6 +643,8 @@ struct ProviderOrderTests {
             baseURL: "https://example.com",
             chatEndpointPath: Provider.defaultChatEndpointPath,
             apiFormat: "openai-compatible",
+            multiKeyEnabled: false,
+            maximumKeyRetries: 3,
             proxyIsEnabled: nil,
             proxyType: nil,
             proxyHost: nil,

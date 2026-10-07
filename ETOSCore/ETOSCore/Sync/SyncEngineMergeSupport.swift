@@ -33,7 +33,9 @@ extension SyncEngine {
             enhancedPrompt: session.enhancedPrompt,
             lorebookIDs: session.lorebookIDs,
             tagIDs: session.tagIDs,
-            worldbookContextIsolationEnabled: session.worldbookContextIsolationEnabled,
+            memoryContextIsolationEnabled: session.memoryContextIsolationEnabled,
+            toolContextIsolationEnabled: session.toolContextIsolationEnabled,
+            globalSystemPromptIsolationEnabled: session.globalSystemPromptIsolationEnabled,
             folderID: session.folderID,
             isTemporary: false
         )
@@ -55,7 +57,9 @@ extension SyncEngine {
             enhancedPrompt: session.enhancedPrompt,
             lorebookIDs: session.lorebookIDs,
             tagIDs: session.tagIDs,
-            worldbookContextIsolationEnabled: session.worldbookContextIsolationEnabled,
+            memoryContextIsolationEnabled: session.memoryContextIsolationEnabled,
+            toolContextIsolationEnabled: session.toolContextIsolationEnabled,
+            globalSystemPromptIsolationEnabled: session.globalSystemPromptIsolationEnabled,
             folderID: session.folderID,
             isTemporary: false
         )
@@ -191,7 +195,9 @@ extension SyncEngine {
         hasher.combine(session.topicPrompt ?? "")
         hasher.combine(session.enhancedPrompt ?? "")
         hasher.combine(session.folderID?.uuidString ?? "")
-        hasher.combine(session.worldbookContextIsolationEnabled)
+        hasher.combine(session.memoryContextIsolationEnabled)
+        hasher.combine(session.toolContextIsolationEnabled)
+        hasher.combine(session.globalSystemPromptIsolationEnabled)
         for worldbookID in session.lorebookIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
             hasher.combine(worldbookID.uuidString)
         }
@@ -211,6 +217,12 @@ extension SyncEngine {
         hasher.combine(normalizeProviderBaseURL(provider.baseURL, apiFormat: canonicalAPIFormat))
         hasher.combine(provider.normalizedChatEndpointPath)
         hasher.combine(canonicalAPIFormat)
+        hasher.combine(provider.multiKeyEnabled)
+        hasher.combine(provider.maximumKeyRetries)
+        for (key, note) in provider.apiKeyNotes.sorted(by: { $0.key < $1.key }) {
+            hasher.combine(key)
+            hasher.combine(note)
+        }
         for (key, value) in provider.headerOverrides.sorted(by: { $0.key < $1.key }) {
             hasher.combine(key)
             hasher.combine(value)
@@ -280,6 +292,7 @@ extension SyncEngine {
         hasher.combine(pricing.inputPerMillionTokens ?? -1)
         hasher.combine(pricing.outputPerMillionTokens ?? -1)
         hasher.combine(pricing.cacheWritePerMillionTokens ?? -1)
+        hasher.combine(pricing.cacheWriteOneHourPerMillionTokens ?? -1)
         hasher.combine(pricing.cacheReadPerMillionTokens ?? -1)
         hasher.combine(pricing.billingMode.rawValue)
         hasher.combine(pricing.perRequestPrice ?? -1)
@@ -290,15 +303,20 @@ extension SyncEngine {
             hasher.combine(tier.inputPerMillionTokens ?? -1)
             hasher.combine(tier.outputPerMillionTokens ?? -1)
             hasher.combine(tier.cacheWritePerMillionTokens ?? -1)
+            hasher.combine(tier.cacheWriteOneHourPerMillionTokens ?? -1)
             hasher.combine(tier.cacheReadPerMillionTokens ?? -1)
         }
         for timeOverride in pricing.timeOverrides {
             hasher.combine(timeOverride.id.uuidString)
             hasher.combine(timeOverride.startMinuteOfDay)
             hasher.combine(timeOverride.endMinuteOfDay)
+            for weekday in timeOverride.weekdays.sorted(by: { $0.rawValue < $1.rawValue }) {
+                hasher.combine(weekday.rawValue)
+            }
             hasher.combine(timeOverride.inputPerMillionTokens ?? -1)
             hasher.combine(timeOverride.outputPerMillionTokens ?? -1)
             hasher.combine(timeOverride.cacheWritePerMillionTokens ?? -1)
+            hasher.combine(timeOverride.cacheWriteOneHourPerMillionTokens ?? -1)
             hasher.combine(timeOverride.cacheReadPerMillionTokens ?? -1)
         }
     }
@@ -401,6 +419,9 @@ extension SyncEngine {
         hasher.combine(message.tokenUsage?.totalTokens ?? -1)
         hasher.combine(message.tokenUsage?.thinkingTokens ?? -1)
         hasher.combine(message.tokenUsage?.cacheWriteTokens ?? -1)
+        hasher.combine(message.tokenUsage?.cacheWriteFiveMinuteTokens ?? -1)
+        hasher.combine(message.tokenUsage?.cacheWriteOneHourTokens ?? -1)
+        hasher.combine(message.tokenUsage?.uncachedInputTokens ?? -1)
         hasher.combine(message.tokenUsage?.cacheReadTokens ?? -1)
         hasher.combine(message.modelReference?.providerName ?? "")
         hasher.combine(message.modelReference?.modelName ?? "")
@@ -745,7 +766,10 @@ extension SyncEngine {
                 totalTokens: maxOptional(lhs.totalTokens, rhs.totalTokens),
                 thinkingTokens: maxOptional(lhs.thinkingTokens, rhs.thinkingTokens),
                 cacheWriteTokens: maxOptional(lhs.cacheWriteTokens, rhs.cacheWriteTokens),
-                cacheReadTokens: maxOptional(lhs.cacheReadTokens, rhs.cacheReadTokens)
+                cacheWriteFiveMinuteTokens: maxOptional(lhs.cacheWriteFiveMinuteTokens, rhs.cacheWriteFiveMinuteTokens),
+                cacheWriteOneHourTokens: maxOptional(lhs.cacheWriteOneHourTokens, rhs.cacheWriteOneHourTokens),
+                cacheReadTokens: maxOptional(lhs.cacheReadTokens, rhs.cacheReadTokens),
+                uncachedInputTokens: maxOptional(lhs.uncachedInputTokens, rhs.uncachedInputTokens)
             )
         }
     }

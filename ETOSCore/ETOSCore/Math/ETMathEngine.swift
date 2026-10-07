@@ -7,6 +7,7 @@
 // ============================================================================
 
 import Foundation
+import Markdown
 
 public enum ETMathContentSegment: Equatable, Sendable {
     case text(String)
@@ -70,6 +71,54 @@ public enum ETMathContentParser {
     }
 
     private static func parseSegmentsUncached(in source: String) -> [ETMathContentSegment] {
+        guard source.contains("$") || source.contains("\\") else {
+            return source.isEmpty ? [] : [.text(source)]
+        }
+
+        // 代码框的内容还会交给复制和网页预览，不能把脚本中的 $ 或反斜杠改写成公式。
+        // 复用 Markdown 语法树识别围栏、缩进和行内代码，避免另写一套不一致的围栏规则。
+        var collector = ETMathCodeRangeCollector(source: source)
+        collector.visit(Document(parsing: source))
+        return parseSegments(in: source, codeRanges: collector.ranges)
+    }
+
+    static func parseSegments(in source: String, codeRanges: [Range<String.Index>]) -> [ETMathContentSegment] {
+        guard !codeRanges.isEmpty else { return parseMathSegments(in: source) }
+
+        var segments: [ETMathContentSegment] = []
+        var textBuffer = ""
+        func appendMath(in text: Substring) {
+            for segment in parseMathSegments(in: String(text)) {
+                if case .text(let text) = segment {
+                    textBuffer.append(text)
+                } else {
+                    if !textBuffer.isEmpty {
+                        segments.append(.text(textBuffer))
+                        textBuffer = ""
+                    }
+                    segments.append(segment)
+                }
+            }
+        }
+
+        var cursor = source.startIndex
+        // Markdown 遍历结果中的源码范围可能乱序或交叠，不能直接用下一个起点构造切片。
+        // 按源码顺序取保护范围的并集，游标只前进，避免崩溃、重复文本或把代码重新识别为公式。
+        for range in codeRanges.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            guard range.upperBound > cursor else { continue }
+            if cursor < range.lowerBound {
+                appendMath(in: source[cursor..<range.lowerBound])
+            }
+            let protectedStart = max(cursor, range.lowerBound)
+            textBuffer.append(contentsOf: source[protectedStart..<range.upperBound])
+            cursor = range.upperBound
+        }
+        appendMath(in: source[cursor...])
+        if !textBuffer.isEmpty { segments.append(.text(textBuffer)) }
+        return segments
+    }
+
+    private static func parseMathSegments(in source: String) -> [ETMathContentSegment] {
         var segments: [ETMathContentSegment] = []
         var buffer = ""
         var index = source.startIndex
@@ -222,6 +271,55 @@ public enum ETMathContentParser {
         default:
             return false
         }
+    }
+}
+
+private struct ETMathCodeRangeCollector: MarkupWalker {
+    let source: String
+    let lineStarts: [String.UTF8View.Index]
+    var ranges: [Range<String.Index>] = []
+
+    init(source: String) {
+        self.source = source
+        var starts = [source.utf8.startIndex]
+        var index = source.utf8.startIndex
+        while index < source.utf8.endIndex {
+            let byte = source.utf8[index]
+            index = source.utf8.index(after: index)
+            // Markdown 将 CR、LF、CRLF 都视为换行；CRLF 必须只计一行，并保留原文字节。
+            if byte == 0x0D, index < source.utf8.endIndex, source.utf8[index] == 0x0A {
+                index = source.utf8.index(after: index)
+            }
+            if byte == 0x0D || byte == 0x0A { starts.append(index) }
+        }
+        lineStarts = starts
+    }
+
+    mutating func visitCodeBlock(_ codeBlock: Markdown.CodeBlock) {
+        append(codeBlock.range)
+    }
+
+    mutating func visitInlineCode(_ inlineCode: InlineCode) {
+        append(inlineCode.range)
+    }
+
+    private mutating func append(_ range: SourceRange?) {
+        guard let range,
+              let lower = index(at: range.lowerBound),
+              let upper = index(at: range.upperBound),
+              lower < upper else { return }
+        ranges.append(lower..<upper)
+    }
+
+    private func index(at location: SourceLocation) -> String.Index? {
+        guard location.line > 0, location.line <= lineStarts.count,
+              location.column > 0 else { return nil }
+        // Markdown 的列号按 UTF-8 字节计数；中文和 emoji 前缀不能按字符数偏移。
+        let lineEnd = location.line < lineStarts.count ? lineStarts[location.line] : source.utf8.endIndex
+        guard let index = source.utf8.index(
+            lineStarts[location.line - 1], offsetBy: location.column - 1, limitedBy: lineEnd
+        ) else { return nil }
+        return index.samePosition(in: source)
     }
 }
 

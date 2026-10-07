@@ -27,6 +27,7 @@ public class OpenAIAdapter: APIAdapter {
     static let responsesRequestSignatureKey = "openai_responses_request_signature"
     static let responsesContextSignatureKey = "openai_responses_context_signature"
     static let responsesForceFullInputControlKey = "openai_responses_force_full_input"
+    static let assistantPrefillMessageIDControlKey = "etos.assistant_prefill_message_id"
     static let responsesOutputItemIDKey = "openai_responses_output_item_id"
     static let responsesOutputItemStatusKey = "openai_responses_output_item_status"
     static let responsesModeSignalKeys: Set<String> = [
@@ -47,7 +48,9 @@ public class OpenAIAdapter: APIAdapter {
         "use_responses_api",
         streamIncludeUsageControlKey,
         reasoningContentEchoModeControlKey,
-        responsesForceFullInputControlKey
+        responsesForceFullInputControlKey,
+        assistantPrefillMessageIDControlKey,
+        requestLogSuppressionControlKey
     ]
     static let chatCompletionsOnlyKeys: Set<String> = [
         "functions",

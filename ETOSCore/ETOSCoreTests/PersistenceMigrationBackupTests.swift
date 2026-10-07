@@ -8,9 +8,76 @@
 
 import Testing
 import Foundation
+import GRDB
+import ZIPFoundation
 @testable import ETOSCore
 
 extension PersistenceTests {
+    @Test("启动备份跨启动复用未变副本，提交变化或副本损坏后重建")
+    func testLaunchBackupReusesOnlyUnchangedHealthySnapshot() throws {
+        cleanup(sessions: [])
+        let previousBackupEnabled = enableLaunchBackupForTest()
+        let previousOverride = Persistence.grdbEnabledOverrideForTests
+        let session = ChatSession(id: UUID(), name: "备份版本测试", isTemporary: false)
+        Persistence.grdbEnabledOverrideForTests = true
+        Persistence.resetGRDBStoreForTests()
+        defer {
+            restoreLaunchBackupAfterTest(previousBackupEnabled)
+            Persistence.grdbEnabledOverrideForTests = previousOverride
+            Persistence.resetGRDBStoreForTests()
+            cleanup(sessions: [session])
+        }
+
+        Persistence.saveChatSessions([session])
+        Persistence.saveMessages([ChatMessage(role: .user, content: "原内容")], for: session.id)
+        Persistence.bootstrapGRDBStoreOnLaunch()
+        Persistence.createLaunchBackupPointIfEnabled()
+        let backupDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: backupDate], ofItemAtPath: chatStoreBackupSQLiteURL.path)
+        let originalBackup = try Data(contentsOf: chatStoreBackupSQLiteURL)
+        let originalRevision = try Persistence.withRawDatabase(at: chatStoreSQLiteURL, readOnly: true) {
+            try LaunchBackupRevisionTracking.read(in: $0)
+        }
+        let originalSchema = sqliteCount(chatStoreSQLiteURL, sql: "PRAGMA schema_version")
+        #expect(sqliteCount(chatStoreSQLiteURL, sql: "SELECT schema_version FROM _etos_launch_backup_revision") == originalSchema)
+        let originalSchemaSQL = try Persistence.withRawDatabase(at: chatStoreSQLiteURL, readOnly: true) {
+            try String.fetchAll($0, sql: "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+        }
+
+        Persistence.resetGRDBStoreForTests()
+        Persistence.bootstrapGRDBStoreOnLaunch()
+        let reopenedRevision = try Persistence.withRawDatabase(at: chatStoreSQLiteURL, readOnly: true) {
+            try LaunchBackupRevisionTracking.read(in: $0)
+        }
+        #expect(reopenedRevision == originalRevision)
+        let reopenedSchemaSQL = try Persistence.withRawDatabase(at: chatStoreSQLiteURL, readOnly: true) {
+            try String.fetchAll($0, sql: "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+        }
+        #expect(reopenedSchemaSQL == originalSchemaSQL)
+        #expect(LaunchBackupRevisionTracking.matches(try #require(reopenedRevision), backupURL: chatStoreBackupSQLiteURL))
+        let preparedRevision = try LaunchBackupRevisionTracking.prepare(at: chatStoreSQLiteURL)
+        #expect(preparedRevision == reopenedRevision)
+        Persistence.createLaunchBackupPointIfEnabled()
+        #expect(try Data(contentsOf: chatStoreBackupSQLiteURL) == originalBackup)
+        #expect(try FileManager.default.attributesOfItem(atPath: chatStoreBackupSQLiteURL.path)[.modificationDate] as? Date == backupDate)
+
+        Persistence.saveMessages([ChatMessage(role: .user, content: "新内容")], for: session.id)
+        Persistence.resetLaunchBackupStateForSnapshotRestore()
+        Persistence.createLaunchBackupPointIfEnabled()
+        #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages WHERE content = '新内容'") == 1)
+
+        try Data("损坏的副本".utf8).write(to: chatStoreBackupSQLiteURL, options: .atomic)
+        Persistence.resetLaunchBackupStateForSnapshotRestore()
+        Persistence.createLaunchBackupPointIfEnabled()
+        #expect(Persistence.isDatabaseHealthy(at: chatStoreBackupSQLiteURL))
+        #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages WHERE content = '新内容'") == 1)
+
+        try FileManager.default.removeItem(at: chatStoreBackupSQLiteURL)
+        Persistence.resetLaunchBackupStateForSnapshotRestore()
+        Persistence.createLaunchBackupPointIfEnabled()
+        #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages WHERE content = '新内容'") == 1)
+    }
+
     @Test("GRDB 启动迁移后自动清理旧 JSON 会话文件")
     func testBootstrapGRDBImportAndCleanupLegacyJSON() async throws {
         cleanup(sessions: [])
@@ -54,7 +121,7 @@ extension PersistenceTests {
         #expect(!FileManager.default.fileExists(atPath: legacyMessageFileURL(sessionID).path))
     }
 
-    @Test("启动备份会裁剪 chat-store 的 FTS 结构")
+    @Test("启动备份移除 FTS、保留消息和空闲页，避免再次重写整库")
     func testLaunchBackupCreatesSlimChatStoreBackup() {
         cleanup(sessions: [])
 
@@ -86,6 +153,9 @@ extension PersistenceTests {
         #expect(!sqliteExists(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_ad'"))
         #expect(!sqliteExists(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_au'"))
         #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages") == messages.count)
+        #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "PRAGMA freelist_count") > 0)
+        // 原库索引不受恢复副本裁剪影响。
+        #expect(sqliteExists(chatStoreSQLiteURL, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'"))
     }
 
     @Test("离线快照会打包三处分库并排除 FTS 与向量库")
@@ -121,6 +191,20 @@ extension PersistenceTests {
         #expect(result.backupKind == .database)
         #expect(Set(result.includedDatabaseNames) == ["chat-store.sqlite", "config-store.sqlite", "memory-store.sqlite"])
         #expect(result.includedFilePaths.isEmpty)
+
+        let extractedDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("snapshot-content-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: extractedDirectory, withIntermediateDirectories: true)
+        defer { removeIfExists(extractedDirectory) }
+        let archive = try Archive(url: result.fileURL, accessMode: .read)
+        let chatEntry = try #require(archive["Databases/chat-store.sqlite"])
+        let exportedChatURL = extractedDirectory.appendingPathComponent("chat-store.sqlite")
+        _ = try archive.extract(chatEntry, to: exportedChatURL)
+        #expect(Persistence.isDatabaseHealthy(at: exportedChatURL, encrypted: false))
+        #expect(sqliteCount(exportedChatURL, sql: "SELECT COUNT(*) FROM messages") == messages.count)
+        #expect(sqliteCount(exportedChatURL, sql: "PRAGMA freelist_count") == 0)
+        #expect(!sqliteExists(exportedChatURL, sql: "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts'"))
+        // 瘦身只能发生在快照副本上，原库搜索能力必须保留。
+        #expect(sqliteExists(chatStoreSQLiteURL, sql: "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts'"))
     }
 
     @Test("完整快照会打包用户文件并可恢复")
@@ -285,10 +369,15 @@ extension PersistenceTests {
         let previousOverride = Persistence.grdbEnabledOverrideForTests
         let snapshotSession = ChatSession(id: UUID(), name: "Snapshot Restore Source", isTemporary: false)
         let replacementSession = ChatSession(id: UUID(), name: "Snapshot Restore Target", isTemporary: false)
+        let linuxVariable = LocalLinuxEnvironmentVariable(
+            name: "RESTORE_TEST_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))",
+            value: "保留 Linux 设置"
+        )
 
         Persistence.grdbEnabledOverrideForTests = true
         Persistence.resetGRDBStoreForTests()
         defer {
+            _ = Persistence.deleteLocalLinuxEnvironmentVariable(id: linuxVariable.id)
             Persistence.grdbEnabledOverrideForTests = previousOverride
             Persistence.resetGRDBStoreForTests()
             cleanup(sessions: [snapshotSession, replacementSession])
@@ -296,6 +385,7 @@ extension PersistenceTests {
 
         Persistence.saveChatSessions([snapshotSession])
         Persistence.saveMessages([ChatMessage(role: .user, content: "snapshot-restore-source")], for: snapshotSession.id)
+        #expect(Persistence.saveLocalLinuxEnvironmentVariable(linuxVariable))
         #expect(Persistence.saveAuxiliaryBlob(["value": "snapshot"], forKey: "providers_v1"))
         try ConversationMemoryManager.saveUserProfile(
             content: "恢复源用户画像",
@@ -326,6 +416,17 @@ extension PersistenceTests {
         let restoredProfile = ConversationMemoryManager.loadUserProfile()
         #expect(restoredProfile?.content == "恢复源用户画像")
         #expect(restoredProfile?.sourceSessionID == snapshotSession.id)
+        #expect(Persistence.loadLocalLinuxEnvironmentVariables().contains { $0.id == linuxVariable.id && $0.value == linuxVariable.value })
+
+        // 再经“导入数据”入口恢复同一归档，确认关系表配置也与直接恢复一致。
+        #expect(Persistence.deleteLocalLinuxEnvironmentVariable(id: linuxVariable.id))
+        do {
+            _ = try ThirdPartyImportService.prepareImport(source: .etosBackup, fileURL: snapshotURL)
+            Issue.record("快照导入必须进入完整恢复确认")
+        } catch let request as SnapshotRestoreRequest {
+            try SnapshotRestoreService.restorePlainSnapshot(from: request.fileURL)
+        }
+        #expect(Persistence.loadLocalLinuxEnvironmentVariables().contains { $0.id == linuxVariable.id && $0.value == linuxVariable.value })
     }
 
     @Test("数据库物理加密开启时恢复快照会保持三处分库加密")

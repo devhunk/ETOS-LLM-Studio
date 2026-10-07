@@ -204,15 +204,13 @@ struct WatchWorldbookDetailView: View {
         }
         .navigationTitle(NSLocalizedString("世界书详情", comment: "Worldbook detail title"))
         .onAppear(perform: load)
-        .sheet(item: $editingEntryDraft) { draft in
-            NavigationStack {
-                WatchWorldbookEntryEditView(
-                    draft: draft,
-                    onSave: { entry in
-                        upsertEntry(entry)
-                    }
-                )
-            }
+        .navigationDestination(item: $editingEntryDraft) { draft in
+            WatchWorldbookEntryEditView(
+                draft: draft,
+                onSave: { entry in
+                    upsertEntry(entry)
+                }
+            )
         }
         .confirmationDialog(
             NSLocalizedString("确认删除条目", comment: "Confirm deleting entry"),
@@ -237,6 +235,43 @@ struct WatchWorldbookDetailView: View {
         } message: {
             Text(NSLocalizedString("删除后不可恢复。", comment: "Delete entry irreversible"))
         }
+        .guideSettingsPageContext(
+            id: GuidePageID(rawValue: "watch-worldbook-\(worldbookID.uuidString.lowercased())"),
+            title: String(format: NSLocalizedString("世界书：%@", comment: "世界书详情向导标题"), worldbook?.name ?? NSLocalizedString("世界书详情", comment: "Worldbook detail title")),
+            documents: [GuideDocumentReference(id: "worldbooks", title: "Worldbooks")],
+            settings: guideSettings
+        )
+        .watchGuideEntry()
+    }
+
+    private var guideSettings: [GuidePageSetting] {
+        guard let worldbook else {
+            return [.readOnly("worldbook_missing", label: NSLocalizedString("世界书不存在", comment: "世界书详情向导字段"), value: { .bool(true) })]
+        }
+        return [
+            .readOnly("id", label: NSLocalizedString("世界书 ID", comment: "世界书详情向导字段"), value: { .string(worldbook.id.uuidString) }),
+            .string("name", label: NSLocalizedString("世界书名称", comment: "世界书详情向导字段"), allowsEmpty: false, get: { nameDraft }, set: { nameDraft = $0; saveBasicInfo() }),
+            .string("description", label: NSLocalizedString("世界书描述", comment: "世界书详情向导字段"), get: { descriptionDraft }, set: { descriptionDraft = $0; saveBasicInfo() }),
+            .integer("scan_depth", label: NSLocalizedString("扫描深度", comment: "世界书详情向导字段"), range: 1...Int.max, get: { worldbook.settings.scanDepth }, set: { settingsScanDepthBinding.wrappedValue = $0 }),
+            .integer("max_recursion_depth", label: NSLocalizedString("最大递归层级", comment: "世界书详情向导字段"), range: 0...Int.max, get: { worldbook.settings.maxRecursionDepth }, set: { settingsMaxRecursionDepthBinding.wrappedValue = $0 }),
+            .integer("max_injected_entries", label: NSLocalizedString("最大注入条目（-1 表示不限制）", comment: "世界书详情向导字段"), range: -1...Int.max, get: { worldbook.settings.maxInjectedEntries }, set: { settingsMaxInjectedEntriesBinding.wrappedValue = $0 }),
+            .integer("max_injected_characters", label: NSLocalizedString("最大注入字符（-1 表示不限制）", comment: "世界书详情向导字段"), range: -1...Int.max, get: { worldbook.settings.maxInjectedCharacters }, set: { settingsMaxInjectedCharsBinding.wrappedValue = $0 }),
+            .string("fallback_position", label: NSLocalizedString("备用插入位置", comment: "世界书详情向导字段"), allowedValues: WorldbookPosition.allCases.map(\.rawValue), allowsEmpty: false, get: { worldbook.settings.fallbackPosition.rawValue }, set: { rawValue in
+                if let position = WorldbookPosition(rawValue: rawValue) { settingsFallbackPositionBinding.wrappedValue = position }
+            }),
+            .readOnly("entries", label: NSLocalizedString("世界书条目", comment: "世界书详情向导字段"), value: {
+                .array(orderedEntries.map { entry in
+                    .dictionary([
+                        "id": .string(entry.id.uuidString),
+                        "comment": .string(entry.comment),
+                        "enabled": .bool(entry.isEnabled),
+                        "keys": .array(entry.keys.map(JSONValue.string)),
+                        "position": .string(entry.position.rawValue),
+                        "content_character_count": .int(entry.content.count)
+                    ])
+                })
+            })
+        ]
     }
 
     private func load() {
@@ -303,101 +338,14 @@ struct WatchWorldbookDetailView: View {
 }
 
 struct WatchWorldbookSessionBindingView: View {
-    private enum InjectionBindingTab: String, CaseIterable, Identifiable {
-        case mode
-        case lorebooks
-
-        var id: String { rawValue }
-
-        var title: String {
-            switch self {
-            case .mode:
-                return NSLocalizedString("Mode Injections", comment: "Mode injection tab")
-            case .lorebooks:
-                return NSLocalizedString("Lorebooks", comment: "Lorebooks tab")
-            }
-        }
-    }
-
-    @Binding var session: ChatSession?
-    @State private var worldbooks: [Worldbook] = []
-    @State private var selected = Set<UUID>()
-    @State private var selectedTab: InjectionBindingTab = .lorebooks
+    @ObservedObject var viewModel: ChatViewModel
 
     var body: some View {
-        List {
-            Section {
-                Picker(NSLocalizedString("注入类型", comment: "Injection type"), selection: $selectedTab) {
-                    ForEach(InjectionBindingTab.allCases) { tab in
-                        Text(tab.title).tag(tab)
-                    }
-                }
-            }
-
-            Section {
-                Text(NSLocalizedString("点击条目即可绑定或取消绑定。", comment: "Binding hint tap row"))
-                    .etFont(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-
-            if selectedTab == .mode {
-                Text(NSLocalizedString("Mode Injection 绑定功能将与助手注入页对齐，当前版本先保留 Lorebook 绑定。", comment: "Mode injection placeholder"))
-                    .foregroundStyle(.secondary)
-            } else if worldbooks.isEmpty {
-                Text(NSLocalizedString("暂无可绑定世界书", comment: "No bindable worldbook on watch"))
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(worldbooks) { book in
-                    Button {
-                        toggle(book.id)
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(book.name)
-                                    .etFont(.footnote)
-                                Text(String(format: NSLocalizedString("%d 条", comment: "Entry count short"), book.entries.count))
-                                    .etFont(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: selected.contains(book.id) ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(
-                                    selected.contains(book.id)
-                                    ? AnyShapeStyle(.tint)
-                                    : AnyShapeStyle(.tertiary)
-                                )
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+        WorldbookSessionBindingContent(session: $viewModel.currentSession) { id in
+            WatchWorldbookDetailView(worldbookID: id)
+        } management: {
+            WorldbookSettingsView(viewModel: viewModel, showsSessionBinding: false)
         }
-        .navigationTitle(NSLocalizedString("会话绑定", comment: "Session binding title"))
-        .onAppear(perform: load)
-    }
-
-    private func load() {
-        worldbooks = ChatService.shared.loadWorldbooks().sorted { $0.updatedAt > $1.updatedAt }
-        selected = Set(session?.lorebookIDs ?? [])
-    }
-
-    private func toggle(_ id: UUID) {
-        guard var current = session else { return }
-        if selected.contains(id) {
-            selected.remove(id)
-        } else {
-            selected.insert(id)
-        }
-        current.lorebookIDs = selected.sorted(by: { $0.uuidString < $1.uuidString })
-        persistSessionSettings(current)
-    }
-
-    private func persistSessionSettings(_ current: ChatSession) {
-        session = current
-        ChatService.shared.updateWorldbookSessionSettings(
-            sessionID: current.id,
-            worldbookIDs: current.lorebookIDs,
-            worldbookContextIsolationEnabled: current.worldbookContextIsolationEnabled
-        )
+        .watchGuideEntry()
     }
 }

@@ -132,6 +132,18 @@ extension ContentView {
         .navigationDestination(item: $messageActionsTarget) { target in
             messageActionsView(for: target.id)
         }
+        // 根页面持有导航，避开 List 行手势；布尔绑定也避免导航框架对长正文做哈希。
+        .navigationDestination(isPresented: Binding(
+            get: { fullMessageContentTarget != nil },
+            set: { if !$0 { fullMessageContentTarget = nil } }
+        )) {
+            if let message = fullMessageContentTarget {
+                FullMessageContentView(
+                    content: message.content,
+                    rendersMath: message.role == .assistant
+                )
+            }
+        }
         .navigationDestination(item: $selectedMessagesExportTarget) { target in
             ChatExportFormatsView(
                 session: viewModel.currentSession,
@@ -367,6 +379,7 @@ extension ContentView {
             || viewModel.activeSheet != nil
             || fullErrorContent != nil
             || messageActionsTarget != nil
+            || fullMessageContentTarget != nil
             || messageRewriteTarget != nil
             || selectedMessagesExportTarget != nil
             || isMessageSelectionMode
@@ -455,6 +468,19 @@ extension ContentView {
 
     @ViewBuilder
     var chatBackgroundLayer: some View {
+        GeometryReader { geometry in
+            chatBackgroundContent
+                .task(id: DisplayImageTarget(
+                    size: geometry.size, scale: displayScale,
+                    fillsBounds: viewModel.backgroundContentMode == "fill"
+                )) {
+                    viewModel.updateBackgroundDisplayTarget(size: geometry.size, scale: displayScale)
+                }
+        }
+    }
+
+    @ViewBuilder
+    private var chatBackgroundContent: some View {
         if viewModel.enableBackground,
            viewModel.currentBackgroundIsVideo,
            let videoURL = viewModel.currentBackgroundMediaURL {
@@ -596,7 +622,7 @@ extension ContentView {
         case .editMessage:
             if let messageToEdit = viewModel.messageToEdit {
                 EditMessageView(message: messageToEdit, onSave: { updatedMessage in
-                    viewModel.commitEditedMessage(updatedMessage)
+                    try await viewModel.commitEditedMessage(updatedMessage)
                 })
             }
         case .settings:
@@ -635,7 +661,7 @@ extension ContentView {
                 } else {
                     viewModel.clearPendingMessageJumpTarget()
                 }
-                ChatService.shared.setCurrentSession(selectedSession)
+                Task { await ChatService.shared.selectSession(selectedSession) }
                 isSessionListPresented = false
             },
             updateSessionAction: { session in
@@ -734,7 +760,10 @@ extension ContentView {
         if let message = viewModel.allMessagesForSession.first(where: { $0.id == messageID }) {
             MessageActionsView(
                 message: message,
+                isUserContentTruncated: viewModel.messageStateByID[message.id]?.isUserContentTruncated == true,
+                responseAttemptVersionInfo: viewModel.responseAttemptVersionInfo(for: message),
                 canRetry: viewModel.canRetry(message: message),
+                canPrefill: viewModel.selectedModel?.canRequestAssistantPrefill == true,
                 canRewrite: viewModel.canRewrite(message: message),
                 onInsertText: { text in
                     viewModel.applyToolInputDraftRequest(
@@ -756,6 +785,9 @@ extension ContentView {
                 },
                 onRetry: { message in
                     viewModel.retryMessage(message)
+                },
+                onPrefill: { message in
+                    viewModel.retryMessage(message, prefill: true)
                 },
                 onRetryVideoAnalysis: { message, fileName in
                     try await viewModel.retryVideoAnalysis(message, fileName: fileName)

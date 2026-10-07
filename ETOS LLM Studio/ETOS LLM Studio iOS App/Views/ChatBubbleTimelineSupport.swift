@@ -267,8 +267,9 @@ struct TimelineReasoningStepView: View {
             return thinkingTitle
         }
 
+        let elapsedSeconds = reasoningElapsedSeconds(referenceDate: referenceDate)
         let baseTitle: String
-        if let elapsedSeconds = reasoningElapsedSeconds(referenceDate: referenceDate) {
+        if let elapsedSeconds {
             baseTitle = String(format: NSLocalizedString("已经思考%d秒", comment: ""), elapsedSeconds)
         } else {
             baseTitle = NSLocalizedString("思考过程", comment: "")
@@ -277,6 +278,9 @@ struct TimelineReasoningStepView: View {
         guard let summary = reasoningSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
               !summary.isEmpty else {
             return baseTitle
+        }
+        if let elapsedSeconds {
+            return String(format: NSLocalizedString("%ds: %@", value: "%ds: %@", comment: "思考耗时与摘要的紧凑标题"), elapsedSeconds, summary)
         }
         return String(format: NSLocalizedString("%@：%@", comment: ""), baseTitle, summary)
     }
@@ -357,6 +361,7 @@ struct ToolCallSummaryBubbleRow: View {
 
 struct TimelineToolCallStepContent: View {
     let label: String
+    let displayTitle: String?
     let statusTitle: String
     let statusIconName: String
     let statusColor: Color
@@ -364,7 +369,11 @@ struct TimelineToolCallStepContent: View {
     let customTextColor: Color?
 
     private var titleText: String {
-        "\(NSLocalizedString("调用工具", comment: "Tool call timeline title"))：\(label)"
+        displayTitle ?? String(
+            format: NSLocalizedString("%@：%@", comment: ""),
+            NSLocalizedString("调用工具", comment: "Tool call timeline title"),
+            label
+        )
     }
 
     private var titleColor: Color {

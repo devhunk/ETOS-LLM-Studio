@@ -13,6 +13,7 @@ import ETOSCore
 struct WorldbookSettingsView: View {
     @ObservedObject var viewModel: ChatViewModel
     @ObservedObject private var appConfig = AppConfigStore.shared
+    var showsSessionBinding = true
 
     @State private var worldbooks: [Worldbook] = []
     @State private var selected = Set<UUID>()
@@ -44,15 +45,10 @@ struct WorldbookSettingsView: View {
                 Text(NSLocalizedString("开启后，可从模型选择器快速绑定当前对话使用的世界书。", comment: "Worldbook shortcut setting description"))
             }
 
-            if let session = viewModel.currentSession {
+            if showsSessionBinding, let session = viewModel.currentSession {
                 Section(NSLocalizedString("当前会话", comment: "Current session section")) {
                     NavigationLink {
-                        WatchWorldbookSessionBindingView(
-                            session: Binding(
-                                get: { viewModel.currentSession },
-                                set: { viewModel.currentSession = $0 }
-                            )
-                        )
+                        WatchWorldbookSessionBindingView(viewModel: viewModel)
                     } label: {
                         HStack {
                             Text(NSLocalizedString("绑定世界书", comment: "Bind worldbooks"))
@@ -152,15 +148,6 @@ struct WorldbookSettingsView: View {
             }
         }
         .navigationTitle(NSLocalizedString("世界书", comment: "Worldbook nav title"))
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    createEmptyWorldbook()
-                } label: {
-                    Label(NSLocalizedString("新增", comment: "Add worldbook"), systemImage: "plus")
-                }
-            }
-        }
         .onAppear(perform: load)
         .confirmationDialog(
             NSLocalizedString("确认删除世界书", comment: "Confirm deleting worldbook title"),
@@ -190,6 +177,80 @@ struct WorldbookSettingsView: View {
                 )
             }
         }
+        .guideSettingsPageContext(
+            id: GuidePageID(rawValue: showsSessionBinding ? "watch-settings-worldbooks-\(viewModel.currentSession?.id.uuidString ?? "none")" : "watch-settings-worldbooks-library"),
+            title: NSLocalizedString("世界书", comment: "世界书向导标题"),
+            documents: [GuideDocumentReference(id: "worldbooks", title: "Worldbooks")],
+            settings: guideSettings
+        )
+        .watchGuideEntry(actions: [
+            WatchPageAction(title: NSLocalizedString("新增", comment: "Add worldbook"), systemImage: "plus", perform: createEmptyWorldbook)
+        ])
+    }
+
+    private var guideSettings: [GuidePageSetting] {
+        var settings: [GuidePageSetting] = [
+            .bool("model_picker_shortcut_enabled", label: NSLocalizedString("在模型选择器中显示世界书", comment: "世界书向导字段"), get: { appConfig.modelPickerWorldbookShortcutEnabled }, set: { appConfig.modelPickerWorldbookShortcutEnabled = $0 }),
+            .readOnly("worldbooks", label: NSLocalizedString("已导入世界书", comment: "世界书向导字段"), value: {
+                .array(worldbooks.map { book in
+                    .dictionary([
+                        "id": .string(book.id.uuidString),
+                        "name": .string(book.name),
+                        "description": .string(book.description),
+                        "entry_count": .int(book.entries.count),
+                        "enabled_entry_count": .int(book.entries.filter(\.isEnabled).count),
+                        "bound_to_current_session": .bool(selected.contains(book.id))
+                    ])
+                })
+            })
+        ]
+        if showsSessionBinding, viewModel.currentSession != nil {
+            settings.append(boundWorldbooksSetting)
+        }
+        return settings
+    }
+
+    private var boundWorldbooksSetting: GuidePageSetting {
+        .json(
+            "current_session_worldbook_ids",
+            label: NSLocalizedString("当前会话绑定的世界书", comment: "世界书向导字段"),
+            schema: .dictionary([
+                "type": .string("array"),
+                "items": .dictionary(["type": .string("string"), "enum": .array(worldbooks.map { .string($0.id.uuidString) })]),
+                "uniqueItems": .bool(true)
+            ]),
+            get: { .array((viewModel.currentSession?.lorebookIDs ?? []).map { .string($0.uuidString) }) },
+            normalize: { value in
+                guard case .array(let values) = value else { throw GuideError.invalidToolArguments }
+                let available = Set(worldbooks.map(\.id))
+                let ids = try values.map { item -> UUID in
+                    guard case .string(let rawValue) = item, let id = UUID(uuidString: rawValue), available.contains(id) else {
+                        throw GuideError.invalidToolArguments
+                    }
+                    return id
+                }
+                guard Set(ids).count == ids.count else { throw GuideError.invalidToolArguments }
+                return .array(ids.map { .string($0.uuidString) })
+            },
+            set: { value in
+                guard var session = viewModel.currentSession, case .array(let values) = value else {
+                    throw GuideError.invalidToolArguments
+                }
+                session.lorebookIDs = values.compactMap { item in
+                    guard case .string(let rawValue) = item else { return nil }
+                    return UUID(uuidString: rawValue)
+                }
+                viewModel.currentSession = session
+                selected = Set(session.lorebookIDs)
+                ChatService.shared.updateWorldbookSessionSettings(
+                    sessionID: session.id,
+                    worldbookIDs: session.lorebookIDs,
+                    memoryContextIsolationEnabled: session.memoryContextIsolationEnabled,
+                    toolContextIsolationEnabled: session.toolContextIsolationEnabled,
+                    globalSystemPromptIsolationEnabled: session.globalSystemPromptIsolationEnabled
+                )
+            }
+        )
     }
 
     private func load() {
@@ -230,12 +291,22 @@ struct WorldbookSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 2)
         .sheet(isPresented: isExpanded) {
-            ScrollView {
-                Text(NSLocalizedString(details, comment: "世界书介绍卡片详情"))
-                    .etFont(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
+            NavigationStack {
+                ScrollView {
+                    Text(NSLocalizedString(details, comment: "世界书介绍卡片详情"))
+                        .etFont(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }
+                .navigationTitle(title)
+                .guideSettingsPageContext(
+                    id: "worldbooks-introduction",
+                    title: title,
+                    documents: [GuideDocumentReference(id: "worldbooks", title: "Worldbooks")],
+                    settings: [.readOnly("introduction", label: title, value: { .string(details) })]
+                )
+                .watchGuideEntry()
             }
         }
     }

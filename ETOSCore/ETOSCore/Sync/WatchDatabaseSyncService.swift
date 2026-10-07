@@ -407,18 +407,6 @@ private extension WatchDatabaseSyncService {
         """)
     }
 
-    static func writeSyncMetadata(in db: Database, updatedAt: Date) throws {
-        try ensureMetadataTable(in: db)
-        try db.execute(
-            sql: """
-            INSERT INTO sync_database_metadata (key, updated_at)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at
-            """,
-            arguments: [metadataKey, updatedAt.timeIntervalSince1970]
-        )
-    }
-
     static func readSyncMetadataDate(in db: Database) throws -> Date? {
         guard try tableExists("sync_database_metadata", in: db) else { return nil }
         guard let timestamp = try Double.fetchOne(
@@ -515,6 +503,21 @@ private extension WatchDatabaseSyncService {
     }
 }
 
+extension WatchDatabaseSyncService {
+    // 已持有写事务的操作复用同一连接，避免完成回调重入 writer 或写入替换后的库。
+    static func writeSyncMetadata(in db: Database, updatedAt: Date) throws {
+        try ensureMetadataTable(in: db)
+        try db.execute(
+            sql: """
+            INSERT INTO sync_database_metadata (key, updated_at)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            arguments: [metadataKey, updatedAt.timeIntervalSince1970]
+        )
+    }
+}
+
 private extension PersistenceGRDBStore {
     func writeSyncMetadata(updatedAt: Date) throws {
         try dbPool.write { db in
@@ -548,6 +551,18 @@ private extension PersistenceGRDBStore {
 extension Persistence {
     static func installWatchSyncDatabases(_ sources: [WatchSyncDatabaseKind: URL]) throws {
         guard !sources.isEmpty else { return }
+        databaseReplacementLock.lock()
+        defer { databaseReplacementLock.unlock() }
+
+        if let incomingConfig = sources[.config] {
+            let localMounts = try activeAuxiliaryStore(kind: .config)?.loadLocalLinuxMounts() ?? []
+            // 发送端按设计剥离书签。覆盖前保留接收设备自己的授权，避免一次配置往返
+            // 就把原本可用的目录全部变为“需要重新授权”；处理发生在加密转换之前。
+            try WatchSyncMountAuthorization.preserveLocalAuthorizations(
+                in: incomingConfig,
+                localMounts: localMounts
+            )
+        }
 
         let fileManager = FileManager.default
         let targets = snapshotRestoreTargetURLs()
@@ -588,14 +603,18 @@ extension Persistence {
         )
         defer { try? fileManager.removeItem(at: rollbackDirectory) }
 
-        var didPrepareRollback = false
         do {
-            try closeActiveStoresForSnapshotRestore()
-            resetLaunchBackupStateForSnapshotRestore()
-            try prepareSnapshotRestoreRollback(replacements: replacements, rollbackDirectory: rollbackDirectory)
-            didPrepareRollback = true
-            for replacement in replacements {
-                try replaceDatabaseFile(replacement)
+            try withClosedStoresForDatabaseReplacement {
+                resetLaunchBackupStateForSnapshotRestore()
+                try prepareSnapshotRestoreRollback(replacements: replacements, rollbackDirectory: rollbackDirectory)
+                do {
+                    for replacement in replacements {
+                        try replaceDatabaseFile(replacement)
+                    }
+                } catch {
+                    restoreSnapshotRollback(replacements: replacements, rollbackDirectory: rollbackDirectory)
+                    throw error
+                }
             }
             bootstrapGRDBStoreOnLaunch()
             if sources.keys.contains(.chat) {
@@ -606,9 +625,6 @@ extension Persistence {
             }
             NotificationCenter.default.post(name: .snapshotRestoreDidFinish, object: nil)
         } catch {
-            if didPrepareRollback {
-                restoreSnapshotRollback(replacements: replacements, rollbackDirectory: rollbackDirectory)
-            }
             bootstrapGRDBStoreOnLaunch()
             throw error
         }

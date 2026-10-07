@@ -131,6 +131,8 @@ Bottom of the page, **"Restore from Snapshot"** → pick a `.elsbackup` file →
 
 After restore: "Snapshot restored. If the current screen still shows old data, return to the session list and re-enter."
 
+Snapshots preserve Linux settings in the database, but exclude local Linux system, Home, Shared, workspace, and export files. After reinstalling the app and restoring a snapshot, Linux installs the built-in system on first use. Previously installed packages and workspace files are not restored, and external folders may need authorization again. Resetting Linux stops it and clears the system; installation happens on the next use, so a reset does not depend on a successful startup.
+
 #### Launch Backup Point
 
 **"Create Database Backup on Launch"** dumps a recoverable backup to disk on every app launch.
@@ -154,6 +156,8 @@ Pick a **Source**:
 | **ETOS** | `.elsbackup` or ETOS bundle |
 
 After choosing, tap **"Select File and Parse"** to pick the file in Files.
+
+Selecting an `.elsbackup` file opens the same confirmation flow as **Restore from Snapshot**. Both plain and encrypted snapshots restore the databases covered by the snapshot. watchOS uses this flow for downloaded `.elsbackup` files as well. Legacy ETOS JSON bundles and data from other clients continue to use the import preview and merge flow.
 
 After parsing you'll see an **import summary**: how many providers, sessions, memories, MCPs, Skills, worldbooks will be added.
 
@@ -220,6 +224,14 @@ Watch data depends on the iPhone for sync. **To move the Watch to a new iPhone**
 Launch backups live in the app sandbox. They **do not** auto-sync to iCloud or cloud.
 
 For long-term retention you must **periodically take full snapshots** to iCloud Drive or S3.
+
+### App exits while preparing a backup
+
+Before upload progress appears, the app exports databases, removes rebuildable search indexes, compacts and compresses the copy, and applies password encryption if selected. The compressed backup size does not represent the memory needed during preparation.
+
+If the issue persists after updating, reopen **App Logs on the affected device**, choose the date, and open the file containing `snapshot` in its name. Check the last entries in the `Snapshot` category; API request logging does not need to be enabled. Checkpoints are persisted before each step and include elapsed time, current memory usage, file size, and free disk space. They exclude conversations, backup passwords, and S3/R2 credentials.
+
+`database.vacuum.begin` identifies database compaction; `archive` identifies compression; `encryption` identifies password encryption; `upload.sign.begin` identifies upload signing; and `upload.request.begin` precedes the network request. A missing completion entry does not distinguish memory termination, a system interruption, or manually closing the app. Look for `JetsamEvent` reports as well: [memory termination reports differ from ordinary crash reports](https://developer.apple.com/documentation/xcode/identifying-high-memory-use-with-jetsam-event-reports), so a missing app IPS report on the phone does not establish that backup preparation succeeded.
 
 ## Next
 

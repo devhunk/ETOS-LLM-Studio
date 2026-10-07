@@ -12,6 +12,9 @@ import GRDB
 
 extension Persistence {
     public static func createLaunchBackupPointIfEnabled() {
+        // 启动备份会直接打开原始 SQLite 文件，不能与恢复时的文件替换交错。
+        guard databaseReplacementLock.try() else { return }
+        defer { databaseReplacementLock.unlock() }
         cleanupInterruptedLaunchBackupInstalls()
         guard isLaunchBackupEnabled() else { return }
         guard !hasPendingLaunchRecoveryRequest() else { return }
@@ -79,7 +82,10 @@ extension Persistence {
 
         var result = LaunchPreparationResult()
         for kind in LaunchDatabaseKind.allCases {
-            guard isSQLiteDatabaseHealthy(at: databaseURL(for: kind)) else {
+            let interval = TelemetrySignpost.begin(.launchDatabaseHealthCheck)
+            let healthy = isSQLiteDatabaseHealthy(at: databaseURL(for: kind))
+            TelemetrySignpost.end(interval)
+            guard healthy else {
                 if hasUsableLaunchBackup(for: kind) {
                     result.recoverableKinds.append(kind)
                 } else {
@@ -450,6 +456,11 @@ extension Persistence {
 
         let backupURL = launchBackupURL(for: kind)
         cleanupInterruptedLaunchBackupInstall(for: kind)
+        let sourceRevision = try LaunchBackupRevisionTracking.prepare(at: sourceURL)
+        if LaunchBackupRevisionTracking.matches(sourceRevision, backupURL: backupURL) {
+            logger.info("启动备份内容未变化，复用已校验副本(\(kind.displayName))。")
+            return
+        }
         let tempBackupURL = launchBackupTemporaryURL(for: backupURL)
         try ensureDirectoryExists(backupURL.deletingLastPathComponent())
         try removeSQLiteDatabaseAndSidecarsIfPresent(at: tempBackupURL)
@@ -518,7 +529,8 @@ extension Persistence {
             try db.execute(sql: "DROP TRIGGER IF EXISTS messages_ad")
             try db.execute(sql: "DROP TRIGGER IF EXISTS messages_au")
             try db.execute(sql: "DROP TABLE IF EXISTS messages_fts")
-            try db.execute(sql: "VACUUM")
+            // 恢复备份允许保留空闲页；每次启动压缩会在一致性复制后再次重写整库。
+            // FTS 在恢复后重建，导出快照的压缩策略由 SnapshotBuilder 独立负责。
         }
     }
 

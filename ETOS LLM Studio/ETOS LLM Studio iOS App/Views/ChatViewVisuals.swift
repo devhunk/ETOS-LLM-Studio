@@ -171,6 +171,12 @@ extension ChatView {
                     TelegramDefaultBackground()
                 }
             }
+            .task(id: DisplayImageTarget(
+                size: geometry.size, scale: displayScale,
+                fillsBounds: viewModel.backgroundContentMode == "fill"
+            )) {
+                viewModel.updateBackgroundDisplayTarget(size: geometry.size, scale: displayScale)
+            }
         }
     }
 
@@ -206,7 +212,7 @@ extension ChatView {
 
     var canPresentExpandedScrollNavigationPanel: Bool {
         Self.canPresentExpandedScrollNavigation(
-            viewportHeight: chatScrollViewportHeight,
+            viewportHeight: scrollCoordinator.chatScrollViewportHeight,
             panelHeight: scrollNavigationPanelHeight
         )
     }
@@ -229,17 +235,17 @@ extension ChatView {
             }
             telegramScrollNavigationButton(
                 systemName: "chevron.up",
-                accessibilityLabel: NSLocalizedString("滚动到上一条消息", comment: ""),
-                isEnabled: previousMessageNavigationTargetID != nil
+                accessibilityLabel: NSLocalizedString("上一页", comment: ""),
+                isEnabled: canNavigateOnePageUp
             ) {
-                handleAdjacentMessageNavigation(.previous)
+                handleViewportPageNavigation(.upward)
             }
             telegramScrollNavigationButton(
                 systemName: "chevron.down",
-                accessibilityLabel: NSLocalizedString("滚动到下一条消息", comment: ""),
-                isEnabled: nextMessageNavigationTargetID != nil
+                accessibilityLabel: NSLocalizedString("下一页", comment: ""),
+                isEnabled: canNavigateOnePageDown
             ) {
-                handleAdjacentMessageNavigation(.next)
+                handleViewportPageNavigation(.downward)
             }
             telegramScrollToBottomButton(isEnabled: canNavigateToTimelineBottom) {
                 handleScrollToBottomButtonTap()
@@ -328,10 +334,7 @@ extension ChatView {
         if viewModel.usesManualHistoryLoading && remainingCount > 0 && !viewModel.isHistoryFullyLoaded {
             let chunk = viewModel.historyLoadChunkCount
             Button {
-                suppressAutoScrollOnce = true
-                withAnimation {
-                    viewModel.loadMoreHistoryChunk()
-                }
+                performManualHistoryLoad()
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.up.circle")

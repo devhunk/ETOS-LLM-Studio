@@ -166,6 +166,11 @@ extension ChatBubble {
             }
             .buttonStyle(.plain)
             .watchMessageActionBarItemStyle(foreground: messageActionBarForegroundColor)
+        case .readAloud:
+            MessageReadAloudButton(messageID: message.id) { messageState.message }
+                .etFont(.system(size: 11 * messageActionBarFontScale))
+                .fontWeight(.semibold)
+                .watchMessageActionBarItemStyle(foreground: messageActionBarForegroundColor)
         case .requestTime:
             Label(messageRequestTimeText, systemImage: item.systemImage)
                 .etFont(.system(size: 10 * messageActionBarFontScale))
@@ -245,6 +250,8 @@ extension ChatBubble {
             return canRetry
         case .copyMessage:
             return !message.content.isEmpty
+        case .readAloud:
+            return MessageActionBarAvailability.canReadAloud(message)
         case .requestTime:
             return messageRequestDate != nil
         case .inputTokens:
@@ -341,6 +348,20 @@ extension ChatBubble {
         guard let toolCalls = message.toolCalls, !toolCalls.isEmpty else { return false }
         guard !hasToolResults else { return false }
         return activeToolPermissionRequest == nil
+    }
+
+    // 消息状态只通知气泡自身；不能沿用外层列表在占位插入时计算的流式标记。
+    var showsStreamingIndicators: Bool {
+        isCurrentResponse
+            && messageState.message.role == .assistant
+            && messageState.message.isReceivingStream
+    }
+
+    var shouldShimmerThinkingPlaceholder: Bool {
+        // 等待首包和非流式响应也需要扫光，但不能因此启用流式 Markdown 渲染。
+        isCurrentResponse
+            && messageState.message.role == .assistant
+            && messageState.message.responseMetrics?.responseCompletedAt == nil
     }
 
     var shouldShimmerReasoningHeader: Bool {
@@ -521,7 +542,8 @@ extension ChatBubble {
     }
 
     var shouldShowThinkingIndicator: Bool {
-        message.role == .assistant
+        if message.requestRetryStatus != nil { return true }
+        return message.role == .assistant
             && message.content.isEmpty
             && (message.reasoningContent ?? "").isEmpty
             && (message.toolCalls ?? []).isEmpty
@@ -529,7 +551,7 @@ extension ChatBubble {
 
     var currentThinkingText: String {
         guard shouldShowThinkingIndicator else { return "" }
-        return NSLocalizedString("正在思考...", comment: "")
+        return message.requestRetryStatus?.thinkingText ?? NSLocalizedString("正在思考...", comment: "")
     }
 }
 

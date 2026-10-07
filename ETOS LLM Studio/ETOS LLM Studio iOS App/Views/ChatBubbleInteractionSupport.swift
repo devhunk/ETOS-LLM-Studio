@@ -99,18 +99,28 @@ extension ChatBubble {
         } else if message.role == .assistant,
                   (message.reasoningContent ?? "").isEmpty,
                   (message.toolCalls ?? []).isEmpty {
-            if showsStreamingIndicators {
+            if shouldShimmerThinkingPlaceholder {
                 ShimmeringText(
-                    text: NSLocalizedString("正在思考...", comment: ""),
+                    text: message.requestRetryStatus?.thinkingText ?? NSLocalizedString("正在思考...", comment: ""),
                     font: .subheadline,
                     baseColor: resolvedSecondaryTextColor(default: Color.secondary, customOpacity: 0.75),
                     highlightColor: resolvedTextColor(default: Color.primary.opacity(0.85))
                 )
+                .monospacedDigit()
             } else {
-                Text(NSLocalizedString("正在思考...", comment: ""))
+                Text(message.requestRetryStatus?.thinkingText ?? NSLocalizedString("正在思考...", comment: ""))
                     .etFont(.subheadline)
+                    .monospacedDigit()
                     .foregroundStyle(resolvedSecondaryTextColor(default: Color.secondary, customOpacity: 0.75))
             }
+        }
+
+        if let retryStatus = message.requestRetryStatus,
+           !message.content.isEmpty || !(message.reasoningContent ?? "").isEmpty || !(message.toolCalls ?? []).isEmpty {
+            Text(retryStatus.thinkingText)
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
         }
 
         if canUseTimeline {
@@ -297,6 +307,7 @@ extension ChatBubble {
         } label: {
             TimelineToolCallStepContent(
                 label: label,
+                displayTitle: messageState.toolCallDisplayTitle(for: call.id, isEnabled: mcpManager.toolCallTitleEnabled),
                 statusTitle: status.title,
                 statusIconName: status.iconName,
                 statusColor: status.accentColor,
@@ -462,7 +473,8 @@ extension ChatBubble {
 
     @ViewBuilder
     func toolCallSummaryRow(for call: InternalToolCall) -> some View {
-        let label = toolDisplayLabel(for: call.toolName)
+        let label = messageState.toolCallDisplayTitle(for: call.id, isEnabled: mcpManager.toolCallTitleEnabled)
+            ?? toolDisplayLabel(for: call.toolName)
         let status = toolCallStatus(for: call)
         Button {
             showRawToolResultInDetailSheet = false

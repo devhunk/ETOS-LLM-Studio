@@ -138,25 +138,37 @@ extension ChatViewModel {
     func saveDailyPulseCard(_ card: DailyPulseCard, from runID: UUID) -> ChatSession? {
         if let savedSessionID = card.savedSessionID,
            let existing = chatSessions.first(where: { $0.id == savedSessionID }) {
-            chatService.setCurrentSession(existing)
+            Task { [weak self] in await self?.chatService.selectSession(existing) }
             return existing
         }
         return DailyPulseManager.shared.saveCardAsSession(cardID: card.id, runID: runID)
     }
 
     func continueDailyPulseCard(_ card: DailyPulseCard, from runID: UUID) {
-        guard let session = saveDailyPulseCard(card, from: runID) else { return }
-        chatService.setCurrentSession(session)
-        userInput = DailyPulseManager.defaultContinuationPrompt(for: card)
-        NotificationCenter.default.post(name: .requestSwitchToChatTab, object: nil)
+        let existing = card.savedSessionID.flatMap { id in chatSessions.first { $0.id == id } }
+        guard let session = existing
+            ?? DailyPulseManager.shared.saveCardAsSession(cardID: card.id, runID: runID) else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await chatService.selectSession(session)
+            guard chatService.currentSessionSubject.value?.id == session.id else { return }
+            userInput = DailyPulseManager.defaultContinuationPrompt(for: card)
+            NotificationCenter.default.post(name: .requestSwitchToChatTab, object: nil)
+        }
     }
 
     func applyDailyPulseContinuation(sessionID: UUID, prompt: String) {
         if let session = chatSessions.first(where: { $0.id == sessionID })
             ?? chatService.chatSessionsSubject.value.first(where: { $0.id == sessionID }) {
-            chatService.setCurrentSession(session)
+            Task { [weak self] in
+                guard let self else { return }
+                await chatService.selectSession(session)
+                guard chatService.currentSessionSubject.value?.id == session.id else { return }
+                userInput = prompt
+            }
+        } else {
+            userInput = prompt
         }
-        userInput = prompt
     }
 
     func setSelectedModel(_ model: RunnableModel) {
@@ -164,7 +176,7 @@ extension ChatViewModel {
     }
 
     func setCurrentSession(_ session: ChatSession) {
-        chatService.setCurrentSession(session)
+        Task { [weak self] in await self?.chatService.selectSession(session) }
     }
 
     func requestMessageJump(sessionID: UUID, messageOrdinal: Int) {
@@ -179,7 +191,7 @@ extension ChatViewModel {
     func setCurrentSessionIfExists(sessionID: UUID) -> Bool {
         if let session = chatSessions.first(where: { $0.id == sessionID })
             ?? chatService.chatSessionsSubject.value.first(where: { $0.id == sessionID }) {
-            chatService.setCurrentSession(session)
+            Task { [weak self] in await self?.chatService.selectSession(session) }
             return true
         }
         return false
@@ -233,12 +245,12 @@ extension ChatViewModel {
         chatService.setSessionTags(sessionID: session.id, tagIDs: tagIDs)
     }
 
-    func commitEditedMessage(_ updatedMessage: ChatMessage) {
-        chatService.updateMessage(updatedMessage)
+    func commitEditedMessage(_ updatedMessage: ChatMessage, original: ChatMessage) async throws {
+        try await chatService.updateEditedMessage(updatedMessage, original: original)
         messageToEdit = nil
     }
 
-    func retryMessage(_ message: ChatMessage) {
+    func retryMessage(_ message: ChatMessage, prefill: Bool = false) {
         Task {
             await chatService.retryMessage(
                 message,
@@ -255,7 +267,8 @@ extension ChatViewModel {
                 systemTimeInjectionPosition: systemTimeInjectionPosition,
                 enablePeriodicTimeLandmark: enablePeriodicTimeLandmark,
                 periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
-                enableResponseSpeedMetrics: enableResponseSpeedMetrics
+                enableResponseSpeedMetrics: enableResponseSpeedMetrics,
+                prefill: prefill
             )
         }
     }
@@ -320,7 +333,7 @@ extension ChatViewModel {
     }
 
     func responseAttemptVersionInfo(for message: ChatMessage) -> ChatResponseAttemptVersionInfo? {
-        ChatResponseAttemptSupport.versionInfo(for: message, in: allMessagesForSession)
+        responseAttemptVersionIndex[message.id]
     }
 
     func hasDisplayVersions(for message: ChatMessage) -> Bool {

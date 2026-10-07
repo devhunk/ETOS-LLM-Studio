@@ -17,10 +17,19 @@ extension ChatView {
             .navigationDestination(item: $navigationDestination) { destination in
                 quickActionDestinationView(for: destination)
             }
+            // 根页面持有导航，避开气泡身份重建；布尔绑定也避免导航框架对长正文做哈希。
+            .navigationDestination(isPresented: Binding(
+                get: { fullMessageContentTarget != nil },
+                set: { if !$0 { fullMessageContentTarget = nil } }
+            )) {
+                if let message = fullMessageContentTarget {
+                    FullMessageContentView(content: message.content)
+                }
+            }
             .sheet(item: $editingMessage) { message in
                 NavigationStack {
                     EditMessageView(message: message) { updatedMessage in
-                        viewModel.commitEditedMessage(updatedMessage)
+                        try await viewModel.commitEditedMessage(updatedMessage, original: message)
                     }
                 }
                 .presentationDetents([.medium, .large])
@@ -51,10 +60,12 @@ extension ChatView {
             ) { payload in
                 MessageActionSheet(
                     payload: payload,
+                    isUserContentTruncated: viewModel.messageStateByID[payload.message.id]?.isUserContentTruncated == true,
                     hasDisplayVersions: viewModel.hasDisplayVersions(for: payload.message),
                     displayVersionCount: viewModel.displayVersionCount(for: payload.message),
                     displayCurrentVersionIndex: viewModel.displayCurrentVersionIndex(for: payload.message),
                     canRetry: viewModel.canRetry(message: payload.message),
+                    canPrefill: viewModel.selectedModel?.canRequestAssistantPrefill == true,
                     canRewrite: viewModel.canRewrite(message: payload.message),
                     allMessages: viewModel.allMessagesForSession,
                     providers: viewModel.providers,
@@ -72,6 +83,10 @@ extension ChatView {
                     onRetry: { message in
                         messageActionSheetPayload = nil
                         performDeferredRetry(message)
+                    },
+                    onPrefill: { message in
+                        messageActionSheetPayload = nil
+                        performDeferredRetry(message, prefill: true)
                     },
                     onShowFullError: { content in
                         dismissMessageActionSheet {

@@ -360,6 +360,20 @@ public struct ModelRequestBodyControlState: Codable, Hashable, Sendable {
 }
 
 public enum ModelRequestBodyControlCompiler {
+    /// 与滑块共用端点判定，连续数值接近最高档时不能因最近选项已是末档而提前变色。
+    public static func usesRainbowThinkingSweep(
+        controls: [ModelRequestBodyControl],
+        state: ModelRequestBodyControlState
+    ) -> Bool {
+        controls.contains { control in
+            guard control.isEnabled, control.isSliderEnabled, control.usesRainbowAtMaximum,
+                  let descriptor = ModelRequestBodyControlSliderDescriptor(control: control) else {
+                return false
+            }
+            return descriptor.isMaximumPosition(descriptor.position(in: state))
+        }
+    }
+
     public static func effectiveOverrideParameters(
         base: [String: JSONValue],
         controls: [ModelRequestBodyControl],
@@ -584,7 +598,8 @@ public enum ModelRequestBodyControlDefaults {
                     ModelRequestBodyControlOption(id: "low", title: NSLocalizedString("low", comment: ""), payload: ["reasoning_effort": .string("low")]),
                     ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: ["reasoning_effort": .string("medium")]),
                     ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: ["reasoning_effort": .string("high")]),
-                    ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: ["reasoning_effort": .string("xhigh")])
+                    ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: ["reasoning_effort": .string("xhigh")]),
+                    ModelRequestBodyControlOption(id: "max", title: NSLocalizedString("max", comment: ""), payload: ["reasoning_effort": .string("max")])
                 ]
             )
         case .openAIResponses:
@@ -599,7 +614,8 @@ public enum ModelRequestBodyControlDefaults {
                     ModelRequestBodyControlOption(id: "low", title: NSLocalizedString("low", comment: ""), payload: openAIResponsesThinkingPayload(effort: "low")),
                     ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: openAIResponsesThinkingPayload(effort: "medium")),
                     ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: openAIResponsesThinkingPayload(effort: "high")),
-                    ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: openAIResponsesThinkingPayload(effort: "xhigh"))
+                    ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: openAIResponsesThinkingPayload(effort: "xhigh")),
+                    ModelRequestBodyControlOption(id: "max", title: NSLocalizedString("max", comment: ""), payload: openAIResponsesThinkingPayload(effort: "max"))
                 ]
             )
         }

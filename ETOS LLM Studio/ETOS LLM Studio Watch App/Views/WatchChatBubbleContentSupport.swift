@@ -33,7 +33,21 @@ extension ChatBubble {
     func renderContent(_ content: String) -> some View {
         let shouldRenderAsOutgoing = message.role == .user
             || message.role == .error
-        if let extraction = messageState.roleplayHTML,
+        if messageState.isUserContentTruncated {
+            VStack(alignment: .leading) {
+                Text(content)
+                if let onOpenFullContent, !isSelectionMode {
+                    Button {
+                        // 预览只用于气泡，全文页始终读取未截断的原始消息。
+                        onOpenFullContent(messageState.message)
+                    } label: {
+                        Text(NSLocalizedString("查看完整内容", comment: ""))
+                            .etFont(.caption)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        } else if let extraction = messageState.roleplayHTML,
            let roleplaySessionID,
            extraction.containsHTML {
             VStack(alignment: .leading) {
@@ -133,45 +147,11 @@ extension ChatBubble {
         return String(format: "%d:%02d", minutes, seconds)
     }
 
-    func openWidgetWebPage(payload: ToolWidgetPayload) {
-        let title = payload.title?.trimmingCharacters(in: .whitespacesAndNewlines)
-        webHTMLPageItem = WatchWebHTMLPageItem(
-            title: title?.isEmpty == false ? (title ?? "") : NSLocalizedString("可视化 Widget", comment: ""),
-            html: WatchWebHTMLDocumentFactory.widgetDocument(
-                payload: payload,
-                prefersDarkPalette: colorScheme == .dark
-            )
-        )
-    }
-
     @ViewBuilder
     func widgetInlineSummaryView(payload: ToolWidgetPayload) -> some View {
-        Button {
-            openWidgetWebPage(payload: payload)
-        } label: {
-            HStack(alignment: .top, spacing: 6) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(NSLocalizedString("可视化 Widget", comment: ""))
-                        .etFont(.caption2.weight(.semibold))
-                        .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.9))
-                    if let title = payload.title,
-                       !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(title)
-                            .etFont(.caption2)
-                            .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.85))
-                    }
-                    Text(NSLocalizedString("点按在手表上查看完整渲染。", comment: ""))
-                        .etFont(.caption2)
-                        .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.8))
-                }
-                Spacer(minLength: 4)
-                Image(systemName: "chevron.forward")
-                    .etFont(.caption2.weight(.semibold))
-                    .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.75))
-            }
+        WatchInlineWidgetCard(payload: payload, messageID: message.id, versionIndex: message.getCurrentVersionIndex()) { item in
+            webHTMLPageItem = item
         }
-        .buttonStyle(.plain)
-        .padding(.leading, 4)
     }
 
     @ViewBuilder
@@ -187,7 +167,7 @@ extension ChatBubble {
                     fileName: fileName,
                     height: itemHeight
                 ) { image in
-                    imagePreview = ImagePreviewPayload(image: image)
+                    imagePreview = ImagePreviewPayload(image: image, fileName: fileName)
                 }
             }
         }
@@ -397,14 +377,18 @@ extension ChatBubble {
             return thinkingTitle
         }
 
+        let elapsedSeconds = reasoningElapsedSeconds(referenceDate: referenceDate)
         let baseTitle: String
-        if let elapsedSeconds = reasoningElapsedSeconds(referenceDate: referenceDate) {
+        if let elapsedSeconds {
             baseTitle = String(format: NSLocalizedString("已经思考%d秒", comment: ""), elapsedSeconds)
         } else {
             baseTitle = NSLocalizedString("思考过程", comment: "")
         }
 
         guard let reasoningSummaryText else { return baseTitle }
+        if let elapsedSeconds {
+            return String(format: NSLocalizedString("%ds: %@", value: "%ds: %@", comment: "思考耗时与摘要的紧凑标题"), elapsedSeconds, reasoningSummaryText)
+        }
         return String(format: NSLocalizedString("%@：%@", comment: ""), baseTitle, reasoningSummaryText)
     }
 
@@ -685,7 +669,7 @@ extension ChatBubble {
     func toolResultSection(
         title: String,
         text: String,
-        font: Font,
+        font: ETFont,
         maxHeight: CGFloat
     ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -704,14 +688,14 @@ extension ChatBubble {
     private struct CappedScrollableText: View {
         let text: String
         let maxHeight: CGFloat
-        let font: Font
+        let font: ETFont
         let foreground: Color
         @State private var measuredHeight: CGFloat = 0
 
         var body: some View {
             ScrollView {
                 Text(text)
-                    .etFont(font)
+                    .etFont(font, sampleText: text)
                     .foregroundColor(foreground)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(

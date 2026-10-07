@@ -27,10 +27,10 @@ extension ChatView {
         }
     }
 
-    func performDeferredRetry(_ message: ChatMessage) {
+    func performDeferredRetry(_ message: ChatMessage, prefill: Bool = false) {
         Task { @MainActor in
             await Task.yield()
-            viewModel.retryMessage(message)
+            viewModel.retryMessage(message, prefill: prefill)
         }
     }
 
@@ -80,7 +80,7 @@ extension ChatView {
         Task { @MainActor in
             do {
                 let imageConfiguration = format == .png
-                    ? transcriptSwiftUIImageConfiguration(session: session)
+                    ? await transcriptSwiftUIImageConfiguration(session: session)
                     : nil
                 let exportSource = await Task.detached(priority: .userInitiated) {
                     let resolvedMessages: [ChatMessage]
@@ -282,7 +282,7 @@ extension ChatView {
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await NetworkSessionConfiguration.shared.securedData(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode),
               UIImage(data: data) != nil else {

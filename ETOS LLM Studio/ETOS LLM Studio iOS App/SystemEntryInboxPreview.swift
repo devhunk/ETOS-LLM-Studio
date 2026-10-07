@@ -214,7 +214,7 @@ enum SystemEntryURLRouter {
                     Persistence.loadChatSession(id: sessionID)
                 }.value
                 if let session {
-                    ChatService.shared.setCurrentSession(session)
+                    await ChatService.shared.selectSession(session)
                     NotificationCenter.default.post(name: .requestSwitchToChatTab, object: nil)
                 }
                 return true
@@ -246,6 +246,9 @@ enum SystemEntryURLRouter {
                 return true
             } else if destination == "terminal" {
                 NotificationCenter.default.post(name: .requestSystemEntryRoute, object: SystemEntryRoute.terminal)
+                return true
+            } else if destination == "app" {
+                // Web Clip 只需将 App 带到前台，保留用户上次停留的界面即可。
                 return true
             }
             return false

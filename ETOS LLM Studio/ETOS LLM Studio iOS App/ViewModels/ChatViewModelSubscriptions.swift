@@ -55,7 +55,6 @@ extension ChatViewModel {
         sendSpeechAsAudio = appConfig.sendSpeechAsAudio
         enableSpeechInput = appConfig.enableSpeechInput
         speechModelIdentifier = appConfig.speechModelIdentifier
-        ttsModelIdentifier = appConfig.ttsModelIdentifier
         memoryEmbeddingModelIdentifier = appConfig.memoryEmbeddingModelIdentifier
         titleGenerationModelIdentifier = appConfig.titleGenerationModelIdentifier
         dailyPulseModelIdentifier = appConfig.dailyPulseModelIdentifier
@@ -76,10 +75,12 @@ extension ChatViewModel {
         BackgroundGenerationKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
         BackgroundGenerationAudioKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
         chatService.reloadLocalModelsAndAppConfigBackedModelState()
+        providers = chatService.providersSubject.value
+        applyActivatedConversationModels(chatService.activatedConversationModels)
+        selectedModel = chatService.selectedModelSubject.value
         MessageRegexRuleStore.shared.reload()
         refreshVisualMessagesAfterRegexRulesChange()
         syncSpeechModelSelection()
-        syncTTSModelSelection()
         syncEmbeddingModelSelection()
         syncTitleGenerationModelSelection()
         syncDailyPulseModelSelection()
@@ -124,6 +125,18 @@ extension ChatViewModel {
         )
         applyGlobalSystemPromptSnapshot(snapshot)
         isPersistingGlobalSystemPrompts = false
+    }
+
+    func duplicateGlobalSystemPromptEntry(_ id: UUID) async -> GlobalSystemPromptEntry? {
+        guard !isPersistingGlobalSystemPrompts else { return nil }
+        globalSystemPromptReloadTask?.cancel()
+        isPersistingGlobalSystemPrompts = true
+        defer { isPersistingGlobalSystemPrompts = false }
+        let result = await Task.detached(priority: .userInitiated) {
+            GlobalSystemPromptStore.duplicateEntry(id: id)
+        }.value
+        applyGlobalSystemPromptSnapshot(result.snapshot)
+        return result.entry
     }
 
     func applyGlobalSystemPromptSnapshot(_ snapshot: GlobalSystemPromptSnapshot) {
@@ -231,7 +244,24 @@ extension ChatViewModel {
         }
     }
 
+    func observeUserMessagePreviewCharacterLimit() {
+        AppConfigStore.shared.$userMessagePreviewCharacterLimit
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // 包含暂时离开历史窗口的缓存，返回聊天时不会继续显示旧阈值的预览。
+                for state in self.messageStateByID.values where state.message.role == .user {
+                    self.scheduleVisualMessagePreparationIfNeeded(for: state, source: state.message)
+                }
+                self.messageRenderingRefreshSubject.send(())
+            }
+            .store(in: &cancellables)
+    }
+
     func setupSubscriptions() {
+        observeUserMessagePreviewCharacterLimit()
         NotificationCenter.default.publisher(for: AppConfigStore.persistentStoreDidLoadNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -323,14 +353,32 @@ extension ChatViewModel {
             .map { [chatService] messages in
                 (
                     sessionID: chatService.currentSessionSubject.value?.id,
-                    messages: messages
+                    messages: messages,
+                    forceRendering: false
                 )
             }
+            .merge(with: messageRenderingRefreshSubject.map { [chatService] _ in
+                (
+                    sessionID: chatService.currentSessionSubject.value?.id,
+                    messages: chatService.messagesForSessionSubject.value,
+                    forceRendering: true
+                )
+            })
+            .receive(on: messagePreparationQueue)
+            .scan(Optional<ChatMessageListSnapshot>.none) { @Sendable previous, update in
+                ChatMessageListSnapshot(
+                    messages: update.messages, sessionID: update.sessionID, previous: previous,
+                    renderConfiguration: .load(sessionID: update.sessionID), forceRendering: update.forceRendering,
+                    previewCharacterLimit: ChatUserMessagePreview.configuredCharacterLimit,
+                    visualRules: MessageRegexRuleStore.currentRules()
+                )
+            }
+            .compactMap { @Sendable snapshot in snapshot }
             .receive(on: DispatchQueue.main)
             .sink { [weak self] update in
                 guard let self else { return }
                 guard update.sessionID == chatService.currentSessionSubject.value?.id else { return }
-                applyMessagesUpdate(update.messages, for: update.sessionID)
+                applyMessagesUpdate(update)
             }
             .store(in: &cancellables)
 
@@ -344,9 +392,7 @@ extension ChatViewModel {
                 self.applyActivatedConversationModels(chatService.activatedConversationModels)
                 self.applyActivatedChatModels(chatService.activatedChatModels)
                 self.speechModels = chatService.activatedSpeechModels
-                self.ttsModels = chatService.activatedTTSModels
                 self.syncSpeechModelSelection()
-                self.syncTTSModelSelection()
                 self.syncEmbeddingModelSelection()
                 self.syncTitleGenerationModelSelection()
                 self.syncDailyPulseModelSelection()
@@ -380,14 +426,8 @@ extension ChatViewModel {
                 self.runningSessionIDs = runningSessionIDs
                 refreshCurrentSessionSendingState()
                 flushPendingToolSupplementMessagesIfPossible()
-                if runningSessionIDs.isEmpty {
-                    endBackgroundTaskIfNeeded()
-                } else {
-                    beginBackgroundTaskIfNeeded()
-                }
-                BackgroundGenerationKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
-                BackgroundGenerationAudioKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
-                updateAutoReasoningPreviewState(with: allMessagesForSession)
+                refreshBackgroundGenerationState()
+                updateAutoReasoningPreviewState()
             }
             .store(in: &cancellables)
 
@@ -404,19 +444,20 @@ extension ChatViewModel {
                 guard let self else { return }
                 switch event.status {
                 case .started:
-                    prepareBackgroundReplyNotificationContext(for: event.sessionID)
+                    prepareBackgroundReplyNotificationContext(for: event.sessionID, messages: event.messages)
                 case .finished:
                     if event.sessionID == currentSession?.id {
-                        notifyIfAssistantReplyFinishedInBackground(for: event.sessionID)
+                        notifyIfAssistantReplyFinishedInBackground(for: event.sessionID, messages: event.messages)
                         autoPlayLatestAssistantMessageIfNeeded()
                     } else {
-                        notifyIfAssistantReplyFinishedFromOffscreenSession(event.sessionID)
+                        notifyIfAssistantReplyFinishedFromOffscreenSession(event.sessionID, messages: event.messages)
                     }
                 case .error, .cancelled:
                     pendingReplyNotificationContextBySessionID.removeValue(forKey: event.sessionID)
                 @unknown default:
                     pendingReplyNotificationContextBySessionID.removeValue(forKey: event.sessionID)
                 }
+                refreshBackgroundGenerationState()
             }
             .store(in: &cancellables)
 
@@ -476,16 +517,6 @@ extension ChatViewModel {
             }
             .store(in: &cancellables)
 
-        ttsManager.$isSpeaking
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] speaking in
-                guard let self else { return }
-                if !speaking {
-                    self.ttsManager.updateSelectedModel(self.selectedTTSModel)
-                }
-            }
-            .store(in: &cancellables)
-
         NotificationCenter.default.publisher(for: .globalSystemPromptStoreDidChange)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -519,7 +550,6 @@ extension ChatViewModel {
             .store(in: &cancellables)
 
         syncSpeechModelSelection()
-        syncTTSModelSelection()
         syncEmbeddingModelSelection()
         syncTitleGenerationModelSelection()
         syncDailyPulseModelSelection()

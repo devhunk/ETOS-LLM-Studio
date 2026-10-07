@@ -35,7 +35,7 @@ struct LocalAgentRuntimeTests {
     func agentModeOnlyControlsLocalLinuxCapability() {
         let withoutLinux = AgentToolCapabilityPolicy.resolve(
             mode: .agent,
-            isWorldbookContextIsolated: false,
+            isToolContextIsolated: false,
             localLinuxEnabled: false
         )
         #expect(!withoutLinux.preparesAgentRun)
@@ -45,7 +45,7 @@ struct LocalAgentRuntimeTests {
 
         let chat = AgentToolCapabilityPolicy.resolve(
             mode: .chat,
-            isWorldbookContextIsolated: false,
+            isToolContextIsolated: false,
             localLinuxEnabled: true
         )
         #expect(!chat.preparesAgentRun)
@@ -55,7 +55,7 @@ struct LocalAgentRuntimeTests {
 
         let agent = AgentToolCapabilityPolicy.resolve(
             mode: .agent,
-            isWorldbookContextIsolated: false,
+            isToolContextIsolated: false,
             localLinuxEnabled: true
         )
         #expect(agent.preparesAgentRun)
@@ -65,7 +65,7 @@ struct LocalAgentRuntimeTests {
 
         let isolated = AgentToolCapabilityPolicy.resolve(
             mode: .agent,
-            isWorldbookContextIsolated: true,
+            isToolContextIsolated: true,
             localLinuxEnabled: true
         )
         #expect(!isolated.preparesAgentRun)
@@ -787,7 +787,8 @@ struct LocalAgentRuntimeTests {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let recorder = LocalLinuxDiagnosticsRecorder(
-            storage: LocalLinuxStorageManager(documentsDirectory: directory, appGroupLayout: nil)
+            storage: LocalLinuxStorageManager(documentsDirectory: directory, appGroupLayout: nil),
+            feedbackBuffer: LocalLinuxDiagnosticFeedbackBuffer { _ in }
         )
         let olderJobID = UUID()
         let newerJobID = UUID()

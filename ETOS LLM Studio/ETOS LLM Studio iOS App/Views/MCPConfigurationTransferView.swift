@@ -37,6 +37,13 @@ struct MCPConfigurationTransferView: View {
     var body: some View {
         List {
             Section {
+                SettingsHelpCard(
+                    title: NSLocalizedString("JSON 迁移", comment: ""),
+                    summary: NSLocalizedString("用 JSON 文件迁移 MCP 服务器配置。", comment: "MCP 配置迁移简介"),
+                    details: NSLocalizedString("兼容常见 mcpServers 对象。内置 MCP 不会导出；普通导出会移除名称中含 token、key、secret、auth、password 或 cookie 的值。导入不会安装任何本地命令或依赖。", comment: "MCP 配置迁移说明")
+                )
+            }
+            Section {
                 Button {
                     isImporting = true
                 } label: {
@@ -57,7 +64,7 @@ struct MCPConfigurationTransferView: View {
             } header: {
                 Text(NSLocalizedString("JSON 迁移", comment: "MCP JSON transfer section"))
             } footer: {
-                Text(NSLocalizedString("兼容常见 mcpServers 对象。内置 MCP 不会导出；普通导出会移除名称中含 token、key、secret、auth、password 或 cookie 的值。导入不会安装任何本地命令或依赖。", comment: "MCP JSON transfer footer"))
+                Text(NSLocalizedString("普通导出会移除凭据；导入不会安装依赖。", comment: "MCP 配置迁移简短提示"))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -119,6 +126,28 @@ struct MCPConfigurationTransferView: View {
         } message: {
             Text(message ?? "")
         }
+        .guideSettingsPageContext(
+            id: "mcp-configuration-transfer",
+            title: NSLocalizedString("MCP 配置迁移", comment: "MCP 配置迁移向导上下文标题"),
+            documents: [GuideDocumentReference(id: "mcp-tools", title: "MCP Toolbox")],
+            settings: [
+                .readOnly(
+                    "configured_server_count",
+                    label: NSLocalizedString("已配置服务器数量", comment: "MCP 配置迁移向导字段"),
+                    value: { .int(manager.servers.count) }
+                ),
+                .readOnly(
+                    "supported_format",
+                    label: NSLocalizedString("支持的迁移格式", comment: "MCP 配置迁移向导字段"),
+                    value: { .string("mcpServers JSON") }
+                ),
+                .readOnly(
+                    "secrets_are_excluded_by_default",
+                    label: NSLocalizedString("默认去除敏感字段", comment: "MCP 配置迁移向导字段"),
+                    value: { .bool(true) }
+                )
+            ]
+        )
     }
 
     private func prepareExport(includeSecrets: Bool) {

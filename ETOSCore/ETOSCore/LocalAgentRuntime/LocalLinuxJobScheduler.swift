@@ -157,35 +157,57 @@ public actor LocalLinuxJobScheduler {
     }
 
     public func userVisibleOutput(jobID: UUID) async throws -> String {
-        if let command = activeCommands[jobID] { return command.collector.userVisiblePreview() }
-        if let terminal = activeTerminals[jobID] { return terminal.collector.userVisiblePreview() }
+        if let collector = activeCommands[jobID]?.collector ?? activeTerminals[jobID]?.collector {
+            return await Task.detached(priority: .utility) {
+                collector.userVisiblePreview()
+            }.value
+        }
         guard let job = job(id: jobID) else { throw LocalLinuxRuntimeError.jobNotFound(jobID) }
         guard let relativePath = job.outputRelativePath else { return "" }
         return try await storage.readRawOutput(relativePath: relativePath, maximumBytes: 262_144)
     }
 
+    public func terminalDisplayUpdates(
+        jobID: UUID,
+        appearance: LocalLinuxTerminalAppearance,
+        minimumInterval: Duration
+    ) throws -> AsyncStream<[LocalLinuxTerminalDisplayLine]> {
+        guard let active = activeTerminals[jobID] else {
+            throw LocalLinuxRuntimeError.jobNotFound(jobID)
+        }
+        return active.collector.terminalDisplayUpdates(appearance: appearance, minimumInterval: minimumInterval)
+    }
+
     public func userVisibleTerminalPresentation(
         jobID: UUID,
         appearance: LocalLinuxTerminalAppearance = .dark
-    ) throws -> LocalLinuxTerminalPresentation {
+    ) async throws -> LocalLinuxTerminalPresentation {
         guard let terminal = activeTerminals[jobID] else {
             throw LocalLinuxRuntimeError.jobNotFound(jobID)
         }
-        return terminal.collector.userVisibleTerminalPresentation(appearance: appearance) ?? .empty
+        let collector = terminal.collector
+        // 屏幕解析与快照仍共用锁。等待它或拼接富文本时释放
+        // 调度器 actor，才能让用户输入、中断和其他会话继续被及时调度。
+        return await Task.detached(priority: .utility) {
+            collector.userVisibleTerminalPresentation(appearance: appearance) ?? .empty
+        }.value
     }
 
     public func userVisibleTerminalPreviewPresentation(
         jobID: UUID,
         maximumLines: Int,
         appearance: LocalLinuxTerminalAppearance = .dark
-    ) throws -> LocalLinuxTerminalPresentation {
+    ) async throws -> LocalLinuxTerminalPresentation {
         guard let terminal = activeTerminals[jobID] else {
             throw LocalLinuxRuntimeError.jobNotFound(jobID)
         }
-        return terminal.collector.userVisibleTerminalPreviewPresentation(
-            maximumLines: maximumLines,
-            appearance: appearance
-        ) ?? .empty
+        let collector = terminal.collector
+        return await Task.detached(priority: .utility) {
+            collector.userVisibleTerminalPreviewPresentation(
+                maximumLines: maximumLines,
+                appearance: appearance
+            ) ?? .empty
+        }.value
     }
 
     public func userVisibleOutputPage(
@@ -327,9 +349,12 @@ public actor LocalLinuxJobScheduler {
                 privacyEnabled: AppConfigStore.boolValue(for: .localLinuxEnvironmentPrivacyEnabled),
                 modelByteLimit: UInt64(AppConfigStore.integerValue(for: .localLinuxOutputPreviewBytes))
             )
-            let mountIDs = context?.mountIDs ?? Persistence.loadLocalLinuxMounts()
-                .filter { $0.isEnabled && $0.authorizationState == .available }
-                .map(\.id)
+            let mountIDs: [UUID]
+            if let context {
+                mountIDs = context.mountIDs
+            } else {
+                mountIDs = try await mountManager.activeExternalMountIDs()
+            }
             leases = try await mountManager.acquireLeases(ids: mountIDs)
         } catch {
             job.state = .failed
@@ -487,9 +512,12 @@ public actor LocalLinuxJobScheduler {
                 terminalRows: Int(rows),
                 terminalResponseHandler: { terminalResponseRelay.enqueue($0) }
             )
-            let mountIDs = context?.mountIDs ?? Persistence.loadLocalLinuxMounts()
-                .filter { $0.isEnabled && $0.authorizationState == .available }
-                .map(\.id)
+            let mountIDs: [UUID]
+            if let context {
+                mountIDs = context.mountIDs
+            } else {
+                mountIDs = try await mountManager.activeExternalMountIDs()
+            }
             leases = try await mountManager.acquireLeases(ids: mountIDs)
         } catch {
             job.state = .failed
@@ -638,9 +666,21 @@ public actor LocalLinuxJobScheduler {
 
     /// Linux 热重启只终止依赖 iSH 的作业；浏览器 Agent 使用独立执行链，不应被连带取消。
     public func cancelAllLinuxRuntimeWork() async {
-        activeCommands.values.forEach { try? $0.session.cancel() }
-        activeTerminals.values.forEach { try? $0.session.cancel() }
+        let commands = Array(activeCommands.values)
+        let terminals = Array(activeTerminals.values)
+        commands.forEach { try? $0.session.cancel() }
+        terminals.forEach { try? $0.session.cancel() }
         await MCPLocalStdioActivityRegistry.shared.cancelAll()
+        // stopRuntime 会独占 bridge actor。先等进程退出并释放租约，避免结束回调
+        // 等待 bridge 排空诊断、而 native stop 又等待回调释放租约形成相互等待。
+        for command in commands {
+            _ = await command.session.result()
+            command.mountLeases.forEach { $0.release() }
+        }
+        for terminal in terminals {
+            _ = try? await terminal.session.result()
+            terminal.mountLeases.forEach { $0.release() }
+        }
     }
 
     public func cancelJobs(usingMountID mountID: UUID) async {
@@ -742,6 +782,7 @@ public actor LocalLinuxJobScheduler {
         guard var active = activeCommands.removeValue(forKey: jobID) else {
             preconditionFailure("结构化命令完成时缺少活跃任务记录：\(jobID)")
         }
+        active.mountLeases.forEach { $0.release() }
         active.diagnosticTask.cancel()
         await active.diagnosticTask.value
         _ = await drainRemainingDiagnostics(scope: 2, requestID: active.job.requestID, jobID: jobID)
@@ -765,7 +806,7 @@ public actor LocalLinuxJobScheduler {
             runtime: runtimeSnapshot
         )
         _ = Persistence.saveLocalLinuxJob(active.job)
-        _ = try? await storage.refreshWorkspaceSize(active.workspace)
+        storage.scheduleWorkspaceSizeRefresh(active.workspace)
         await verifyCriticalSystemPathsAfterGuestTask()
         await publishActivityCounts()
         return active.job
@@ -777,6 +818,7 @@ public actor LocalLinuxJobScheduler {
         runtimeSnapshot: LocalLinuxRuntimeSnapshot
     ) async {
         guard var active = activeTerminals.removeValue(forKey: jobID) else { return }
+        active.mountLeases.forEach { $0.release() }
         active.diagnosticTask.cancel()
         await active.diagnosticTask.value
         let remainingDiagnostics = await drainRemainingDiagnostics(
@@ -787,7 +829,7 @@ public actor LocalLinuxJobScheduler {
         for event in remainingDiagnostics {
             active.collector.appendTerminalDiagnostic(event)
         }
-        active.collector.finish()
+        active.collector.finish(completeTerminalUpdates: false)
         let completionReason = suspensionInterruptedJobIDs.remove(jobID) != nil
             ? LocalLinuxCompletionReason.interruptedBySuspension
             : result.completionReason
@@ -807,7 +849,8 @@ public actor LocalLinuxJobScheduler {
             runtime: runtimeSnapshot
         )
         _ = Persistence.saveLocalLinuxJob(active.job)
-        _ = try? await storage.refreshWorkspaceSize(active.workspace)
+        active.collector.finishTerminalUpdates()
+        storage.scheduleWorkspaceSizeRefresh(active.workspace)
         await verifyCriticalSystemPathsAfterGuestTask()
         await publishActivityCounts()
     }
@@ -818,6 +861,7 @@ public actor LocalLinuxJobScheduler {
         runtimeSnapshot: LocalLinuxRuntimeSnapshot
     ) async {
         guard var active = activeTerminals.removeValue(forKey: jobID) else { return }
+        active.mountLeases.forEach { $0.release() }
         active.diagnosticTask.cancel()
         await active.diagnosticTask.value
         let remainingDiagnostics = await drainRemainingDiagnostics(
@@ -828,7 +872,7 @@ public actor LocalLinuxJobScheduler {
         for event in remainingDiagnostics {
             active.collector.appendTerminalDiagnostic(event)
         }
-        active.collector.finish()
+        active.collector.finish(completeTerminalUpdates: false)
         let wasInterruptedBySuspension = suspensionInterruptedJobIDs.remove(jobID) != nil
         active.job.state = wasInterruptedBySuspension ? .interrupted : .failed
         active.job.completionReason = wasInterruptedBySuspension ? .interruptedBySuspension : .runtimeFailure
@@ -844,7 +888,8 @@ public actor LocalLinuxJobScheduler {
             runtime: runtimeSnapshot
         )
         _ = Persistence.saveLocalLinuxJob(active.job)
-        _ = try? await storage.refreshWorkspaceSize(active.workspace)
+        active.collector.finishTerminalUpdates()
+        storage.scheduleWorkspaceSizeRefresh(active.workspace)
         await verifyCriticalSystemPathsAfterGuestTask()
         await publishActivityCounts()
     }

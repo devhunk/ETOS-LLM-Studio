@@ -12,27 +12,12 @@ import UIKit
 import ETOSCore
 
 extension ChatBubble {
-    var telegramBlue: Color {
-        Color(red: 0.24, green: 0.56, blue: 0.95)
-    }
-
-    var telegramBlueDark: Color {
-        Color(red: 0.17, green: 0.45, blue: 0.82)
-    }
-
     var activeAppearanceProfile: ChatAppearanceProfile {
         appearanceProfileManager.activeProfile
     }
 
-    var resolvedUserBubbleStartColor: Color {
-        let slot = activeAppearanceProfile.userBubble
-        guard slot.isEnabled else { return telegramBlue }
-        return ChatAppearanceColorCodec.color(from: slot.hex, fallback: telegramBlue)
-    }
-
     var resolvedUserBubbleEndColor: Color {
-        guard activeAppearanceProfile.userBubble.isEnabled else { return telegramBlueDark }
-        return ChatAppearanceColorCodec.darkened(resolvedUserBubbleStartColor, factor: 0.86)
+        ChatOutgoingBubbleColors(profile: activeAppearanceProfile).end
     }
 
     var resolvedAssistantBubbleColor: Color? {
@@ -179,6 +164,11 @@ extension ChatBubble {
             }
             .buttonStyle(.plain)
             .messageActionBarItemStyle(foreground: messageActionBarForegroundColor)
+        case .readAloud:
+            MessageReadAloudButton(messageID: message.id) { messageState.message }
+                .etFont(.system(size: 13 * messageActionBarFontScale))
+                .fontWeight(.semibold)
+                .messageActionBarItemStyle(foreground: messageActionBarForegroundColor)
         case .requestTime:
             Label(messageRequestTimeText, systemImage: item.systemImage)
                 .etFont(.system(size: 12 * messageActionBarFontScale))
@@ -258,6 +248,8 @@ extension ChatBubble {
             return canRetry
         case .copyMessage:
             return !message.content.isEmpty
+        case .readAloud:
+            return MessageActionBarAvailability.canReadAloud(message)
         case .requestTime:
             return messageRequestDate != nil
         case .inputTokens:
@@ -379,7 +371,6 @@ extension ChatBubble {
         if usesNoBubbleStyle {
             return AnyShapeStyle(Color.clear)
         }
-        let userOpacity = enableBackground ? 0.85 : 1.0
         let assistantOpacity = enableBackground ? 0.75 : 1.0
         let errorOpacity = enableBackground ? 0.8 : 1.0
 
@@ -395,14 +386,8 @@ extension ChatBubble {
 
         if isOutgoing {
             return AnyShapeStyle(
-                LinearGradient(
-                    colors: [
-                        resolvedUserBubbleStartColor.opacity(userOpacity),
-                        resolvedUserBubbleEndColor.opacity(userOpacity)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                ChatOutgoingBubbleColors(profile: activeAppearanceProfile)
+                    .gradient(enableBackground: enableBackground)
             )
         }
 
@@ -554,17 +539,12 @@ extension ChatBubble {
     func bubbleBackground(for shape: BubbleCornerShape) -> some View {
         if usesNoBubbleStyle {
             shape.fill(Color.clear)
-        } else if enableLiquidGlass {
-            if #available(iOS 26.0, *) {
-                shape
-                    .fill(bubbleGradient)
-                    .glassEffect(.clear, in: shape)
-                    .clipShape(shape)
-            } else {
-                shape.fill(bubbleGradient)
-            }
         } else {
-            shape.fill(bubbleGradient)
+            ChatBubbleBackground(
+                shape: shape,
+                fill: AnyShapeStyle(bubbleGradient),
+                enableLiquidGlass: enableLiquidGlass
+            )
         }
     }
 
@@ -735,6 +715,20 @@ extension ChatBubble {
         guard let toolCalls = message.toolCalls, !toolCalls.isEmpty else { return false }
         guard !hasToolResults else { return false }
         return activeToolPermissionRequest == nil
+    }
+
+    // 消息状态只通知气泡自身；不能沿用外层列表在占位插入时计算的流式标记。
+    var showsStreamingIndicators: Bool {
+        isCurrentResponse
+            && messageState.message.role == .assistant
+            && messageState.message.isReceivingStream
+    }
+
+    var shouldShimmerThinkingPlaceholder: Bool {
+        // 等待首包和非流式响应也需要扫光，但不能因此启用流式 Markdown 渲染。
+        isCurrentResponse
+            && messageState.message.role == .assistant
+            && messageState.message.responseMetrics?.responseCompletedAt == nil
     }
 
     var shouldShimmerReasoningHeader: Bool {

@@ -65,10 +65,19 @@ final class PersistenceGRDBStore {
             qos: .userInitiated,
             mmapSize: 134_217_728
         )
-        self.dbPool = try DatabasePool(path: databaseURL.path, configuration: configuration)
+        let databasePath = databaseURL.path
+        self.dbPool = try {
+            let interval = TelemetrySignpost.begin(.databaseConnectionOpen)
+            defer { TelemetrySignpost.end(interval) }
+            return try DatabasePool(path: databasePath, configuration: configuration)
+        }()
         messageWriteQueue.setSpecific(key: messageWriteQueueSpecificKey, value: 1)
 
-        try migrateSchemaIfNeeded()
+        do {
+            let interval = TelemetrySignpost.begin(.databaseSchemaMigration)
+            defer { TelemetrySignpost.end(interval) }
+            try migrateSchemaIfNeeded()
+        }
         scheduleDatabaseMaintenanceIfNeeded()
     }
 
@@ -576,6 +585,45 @@ final class PersistenceGRDBStore {
             try Self.createSystemEntryReceiptTable(db)
         }
 
+        migrator.registerMigration("v17_split_session_context_isolation") { db in
+            var columnNames = Set(
+                try Row.fetchAll(db, sql: "PRAGMA table_info(sessions)").compactMap { row -> String? in
+                    row["name"]
+                }
+            )
+            let columns = [
+                "memory_context_isolation_enabled",
+                "tool_context_isolation_enabled",
+                "global_system_prompt_isolation_enabled"
+            ]
+            for column in columns where !columnNames.contains(column) {
+                try db.execute(sql: "ALTER TABLE sessions ADD COLUMN \(column) INTEGER NOT NULL DEFAULT 0")
+                columnNames.insert(column)
+            }
+            // 缺失的旧可选列由后续结构修复补回默认值；不能在修复前读取它而中断启动。
+            // 旧开关存在时同时控制记忆与工具，迁移后保持原有会话行为。
+            if columnNames.contains("worldbook_context_isolation_enabled") {
+                try db.execute(sql: """
+                    UPDATE sessions
+                    SET memory_context_isolation_enabled = worldbook_context_isolation_enabled,
+                        tool_context_isolation_enabled = worldbook_context_isolation_enabled
+                    WHERE worldbook_context_isolation_enabled != 0
+                """)
+            }
+        }
+
+        migrator.registerMigration("v18_anthropic_cache_pricing_usage") { db in
+            for table in ["usage_request_events", "usage_daily_totals", "usage_daily_model_totals"] {
+                try db.execute(sql: "ALTER TABLE \(table) ADD COLUMN cache_write_five_minute_tokens INTEGER")
+                try db.execute(sql: "ALTER TABLE \(table) ADD COLUMN cache_write_one_hour_tokens INTEGER")
+                try db.execute(sql: "ALTER TABLE \(table) ADD COLUMN uncached_input_tokens INTEGER")
+            }
+        }
+
+        migrator.registerMigration("v19_session_usage_analytics_index") { db in
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_usage_request_events_session_requested ON usage_request_events(session_id, requested_at, event_id)")
+        }
+
         try migrator.migrate(dbPool)
         try repairCoreSchemaIfNeeded()
     }
@@ -624,6 +672,9 @@ final class PersistenceGRDBStore {
             )
             try ensureColumn(db, table: "sessions", column: "lorebook_ids_json", definition: "lorebook_ids_json BLOB NOT NULL DEFAULT X'5B5D'")
             try ensureColumn(db, table: "sessions", column: "worldbook_context_isolation_enabled", definition: "worldbook_context_isolation_enabled INTEGER NOT NULL DEFAULT 0")
+            try ensureColumn(db, table: "sessions", column: "memory_context_isolation_enabled", definition: "memory_context_isolation_enabled INTEGER NOT NULL DEFAULT 0")
+            try ensureColumn(db, table: "sessions", column: "tool_context_isolation_enabled", definition: "tool_context_isolation_enabled INTEGER NOT NULL DEFAULT 0")
+            try ensureColumn(db, table: "sessions", column: "global_system_prompt_isolation_enabled", definition: "global_system_prompt_isolation_enabled INTEGER NOT NULL DEFAULT 0")
             try ensureColumn(db, table: "sessions", column: "is_temporary", definition: "is_temporary INTEGER NOT NULL DEFAULT 0")
             try ensureColumn(db, table: "sessions", column: "sort_index", definition: "sort_index INTEGER NOT NULL DEFAULT 0")
             try ensureColumn(db, table: "sessions", column: "updated_at", definition: "updated_at REAL NOT NULL DEFAULT 0")
@@ -748,6 +799,9 @@ final class PersistenceGRDBStore {
                 container_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
                 lorebook_ids_json BLOB NOT NULL DEFAULT X'5B5D',
                 worldbook_context_isolation_enabled INTEGER NOT NULL DEFAULT 0,
+                memory_context_isolation_enabled INTEGER NOT NULL DEFAULT 0,
+                tool_context_isolation_enabled INTEGER NOT NULL DEFAULT 0,
+                global_system_prompt_isolation_enabled INTEGER NOT NULL DEFAULT 0,
                 is_temporary INTEGER NOT NULL DEFAULT 0,
                 sort_index INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL DEFAULT 0,

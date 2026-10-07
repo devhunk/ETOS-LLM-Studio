@@ -79,7 +79,7 @@
 *   **工作区、挂载与环境变量**：每个会话拥有独立工作区，可把 App、iCloud Drive 或用户明确授权的外部目录以只读或读写方式挂载进 Linux。环境变量保存在 GRDB 中并在启动进程时注入，面向模型、日志与诊断的副本支持敏感值打码。
 *   **统一文件工具与本地 MCP**：现有文件工具同时理解 `app://`、`linux://` 与 `mount://`，不会另造一套绕过审批的 Linux 文件 API。本地 stdio MCP 与 HTTP / SSE 服务器使用同一管理页、排序、工具开关和审批策略，并支持常见 `mcpServers` JSON 导入导出。
 *   **Browser Agent**：iOS 受控 WKWebView 支持会话隔离标签页、DOM / 可访问性快照、点击、输入、滚动、JavaScript、截图、下载和用户接管；watchOS 会探测本机真实能力，并可在用户开启后把缺失操作委托给配对 iPhone。
-*   **64 个 Apple 原生工具**：按设备、媒体与环境、个人数据、视觉与语言四组提供剪贴板、通知、AlarmKit、地图、设备状态、语音、媒体、WeatherKit、HomeKit、Bluetooth、NFC、联系人、照片、定位、Vision 与 NaturalLanguage 等能力。工具按平台和系统版本报告真实可用性，写入或外部副作用仍需逐次审批；部分 watchOS 缺失能力可委托 iPhone。
+*   **Apple 原生工具**：四组目录共包含 64 项设备、媒体与环境、个人数据、视觉与语言能力，按本机平台、系统版本和硬件显示。watchOS 不显示本机不支持的工具，也不通过 iPhone 代执行；天气、HomeKit、蓝牙等支持的能力在本机运行。写入或外部副作用仍需逐次审批。
 *   **持久会话协作**：Agent 可创建隐藏子代理或可见协作会话，选择等待结果、后台交付或完成后续写当前会话。运行状态按 session / run / tool 归属，避免多会话并发时把结果串回错误聊天。
 *   **实时活动与后台完成通知**：iOS 会在锁屏和灵动岛显示 Chat / Agent 的运行、等待输入、完成或失败状态，点按可返回对应会话。App 进入后台后会使用系统授予的短时执行窗口继续回复或 Linux 任务；回复确实在后台结束时才发送本地通知，若系统最终挂起任务则准确记录为中断而不是静默重放。
 
@@ -180,7 +180,7 @@ ETOSCore/ETOSCore/                         ← 平台无关业务逻辑（481 �
 ├── Math/                               ← LaTeX/数学公式渲染引擎
 ├── MCP/                                ← MCP 客户端、内建服务器、服务器存储、Streamable HTTP / SSE 传输（基于官方 swift-sdk）
 ├── Memory/ + SimilaritySearch/         ← 本地 RAG、嵌入、分块、SQLite 向量检索
-├── NativeCapabilities/                 ← 64 个 Apple 原生能力的定义、执行器、权限与双端委托
+├── NativeCapabilities/                 ← Apple 原生能力的定义、执行器、权限与本机可用性
 ├── Parsing/                            ← 请求头与参数表达式解析
 ├── Persistence/                        ← GRDB 主库/辅助库、迁移、启动备份、媒体与文件存储
 ├── Providers/                          ← Provider 模型、代理配置与 OpenAI / Anthropic / Gemini 适配器
@@ -245,6 +245,8 @@ ETOSCore/ETOSCoreTests/                       ← ETOSCore 层测试（147 个 S
     ```
 
     首次运行会构建 iSHApple 的 iOS / watchOS 设备与模拟器切片，以及当前命令要求的 llama.cpp 平台产物，耗时会明显长于后续构建。缓存命中后，脚本会直接复用现有结果；修改 iSH 不会触发 llama.cpp 重编，反之亦然。`--parallel` 默认按本机 CPU 数传给 CMake，也可使用 `--parallel=8`、`--jobs 8` 或 `-j8` 指定任务数。
+
+    更新原生子模块后，必须重新执行对应平台和配置的上述命令，再运行 Xcode 构建或测试。Xcode 本机构建不会自动执行此预构建脚本，可能仍链接旧静态库；脚本执行时才会核对源码缓存标记并更新产物。Xcode Cloud 会在 `ci_pre_xcodebuild.sh` 中执行设备 Release 预构建，本机模拟器构建通过不能替代该检查。
 
     主要产物如下：
 

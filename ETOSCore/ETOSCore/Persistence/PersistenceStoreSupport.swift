@@ -63,6 +63,9 @@ extension Persistence {
                 lorebookIDs: baseRecord.session.lorebookIDs,
                 tagIDs: baseRecord.session.tagIDs,
                 worldbookContextIsolationEnabled: baseRecord.session.worldbookContextIsolationEnabled,
+                memoryContextIsolationEnabled: baseRecord.session.memoryContextIsolationEnabled,
+                toolContextIsolationEnabled: baseRecord.session.toolContextIsolationEnabled,
+                globalSystemPromptIsolationEnabled: baseRecord.session.globalSystemPromptIsolationEnabled,
                 conversationSummary: finalSummary,
                 conversationSummaryUpdatedAt: finalUpdatedAt
             )
@@ -281,7 +284,10 @@ extension Persistence {
                 folderID: session.folderID,
                 lorebookIDs: session.lorebookIDs,
                 tagIDs: session.tagIDs,
-                worldbookContextIsolationEnabled: session.worldbookContextIsolationEnabled ? true : nil,
+                worldbookContextIsolationEnabled: session.memoryContextIsolationEnabled || session.toolContextIsolationEnabled ? true : nil,
+                memoryContextIsolationEnabled: session.memoryContextIsolationEnabled,
+                toolContextIsolationEnabled: session.toolContextIsolationEnabled,
+                globalSystemPromptIsolationEnabled: session.globalSystemPromptIsolationEnabled,
                 conversationSummary: preservedSummary?.conversationSummary,
                 conversationSummaryUpdatedAt: preservedSummary?.conversationSummaryUpdatedAt
             ),
@@ -303,6 +309,9 @@ extension Persistence {
             lorebookIDs: summary.session.lorebookIDs,
             tagIDs: summary.session.tagIDs ?? [],
             worldbookContextIsolationEnabled: summary.session.worldbookContextIsolationEnabled ?? false,
+            memoryContextIsolationEnabled: summary.session.memoryContextIsolationEnabled,
+            toolContextIsolationEnabled: summary.session.toolContextIsolationEnabled,
+            globalSystemPromptIsolationEnabled: summary.session.globalSystemPromptIsolationEnabled ?? false,
             folderID: summary.session.folderID,
             isTemporary: false
         )
@@ -332,7 +341,13 @@ extension Persistence {
         summary.session.folderID == session.folderID &&
         summary.session.lorebookIDs == session.lorebookIDs &&
         (summary.session.tagIDs ?? []) == session.tagIDs &&
-        (summary.session.worldbookContextIsolationEnabled ?? false) == session.worldbookContextIsolationEnabled &&
+        (summary.session.memoryContextIsolationEnabled
+            ?? summary.session.worldbookContextIsolationEnabled
+            ?? false) == session.memoryContextIsolationEnabled &&
+        (summary.session.toolContextIsolationEnabled
+            ?? summary.session.worldbookContextIsolationEnabled
+            ?? false) == session.toolContextIsolationEnabled &&
+        (summary.session.globalSystemPromptIsolationEnabled ?? false) == session.globalSystemPromptIsolationEnabled &&
         summary.prompts.topicPrompt == session.topicPrompt &&
         summary.prompts.enhancedPrompt == session.enhancedPrompt
     }
@@ -425,6 +440,16 @@ extension Persistence {
 
     static func accumulateRequestTokens(_ usage: MessageTokenUsage?, to totals: inout RequestLogTokenTotals) {
         guard let usage else { return }
+        if totals.uncachedInputTokens != nil || usage.uncachedInputTokens != nil {
+            totals.uncachedInputTokens = (totals.uncachedInputTokens ?? max(0, totals.sentTokens - totals.cacheReadTokens))
+                + ModelCostCalculator.billableInputTokens(for: usage)
+        }
+        if totals.cacheWriteFiveMinuteTokens != nil || usage.cacheWriteFiveMinuteTokens != nil {
+            totals.cacheWriteFiveMinuteTokens = (totals.cacheWriteFiveMinuteTokens ?? 0) + (usage.cacheWriteFiveMinuteTokens ?? 0)
+        }
+        if totals.cacheWriteOneHourTokens != nil || usage.cacheWriteOneHourTokens != nil {
+            totals.cacheWriteOneHourTokens = (totals.cacheWriteOneHourTokens ?? 0) + (usage.cacheWriteOneHourTokens ?? 0)
+        }
         totals.sentTokens += usage.promptTokens ?? 0
         totals.receivedTokens += usage.completionTokens ?? 0
         totals.thinkingTokens += usage.thinkingTokens ?? 0

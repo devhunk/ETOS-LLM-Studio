@@ -169,6 +169,12 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     public var role: MessageRole
     public var requestedAt: Date? // 对应请求的发起时间（用于会话 JSON 落盘）
+    /// 仅供当前请求显示，刻意不加入 CodingKeys，恢复历史时不会恢复重试状态。
+    public var requestRetryStatus: ChatRequestRetryStatus? = nil
+    /// 实际流式请求的运行期标记，不持久化，也不从“最后一条助手消息”推断。
+    public var isReceivingStream: Bool = false
+    /// 当次请求的扫光样式快照，不持久化，避免历史消息继承运行时动画配置。
+    public var usesRainbowThinkingSweep: Bool = false
 
     // MARK: - 多版本内容存储
     /// 所有版本的内容数组（内部存储）
@@ -454,9 +460,13 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 /// 消息所关联的一次 API 调用的 Token 统计
 public struct MessageTokenUsage: Codable, Hashable, Sendable {
     public var promptTokens: Int?
+    /// 服务商明确返回的非缓存输入量，避免对 Anthropic 的独立输入量再次扣除缓存命中。
+    public var uncachedInputTokens: Int?
     public var completionTokens: Int?
     public var thinkingTokens: Int?
     public var cacheWriteTokens: Int?
+    public var cacheWriteFiveMinuteTokens: Int?
+    public var cacheWriteOneHourTokens: Int?
     public var cacheReadTokens: Int?
     public var totalTokens: Int?
 
@@ -466,12 +476,18 @@ public struct MessageTokenUsage: Codable, Hashable, Sendable {
         totalTokens: Int?,
         thinkingTokens: Int? = nil,
         cacheWriteTokens: Int? = nil,
-        cacheReadTokens: Int? = nil
+        cacheWriteFiveMinuteTokens: Int? = nil,
+        cacheWriteOneHourTokens: Int? = nil,
+        cacheReadTokens: Int? = nil,
+        uncachedInputTokens: Int? = nil
     ) {
         self.promptTokens = promptTokens
+        self.uncachedInputTokens = uncachedInputTokens
         self.completionTokens = completionTokens
         self.thinkingTokens = thinkingTokens
         self.cacheWriteTokens = cacheWriteTokens
+        self.cacheWriteFiveMinuteTokens = cacheWriteFiveMinuteTokens
+        self.cacheWriteOneHourTokens = cacheWriteOneHourTokens
         self.cacheReadTokens = cacheReadTokens
         self.totalTokens = totalTokens
     }
@@ -482,9 +498,12 @@ public struct MessageTokenUsage: Codable, Hashable, Sendable {
 
     public var hasAnyData: Bool {
         promptTokens != nil
+            || uncachedInputTokens != nil
             || completionTokens != nil
             || thinkingTokens != nil
             || cacheWriteTokens != nil
+            || cacheWriteFiveMinuteTokens != nil
+            || cacheWriteOneHourTokens != nil
             || cacheReadTokens != nil
             || totalTokens != nil
     }

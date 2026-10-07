@@ -13,6 +13,46 @@ import Foundation
 @Suite("MCP 管理器工具暴露测试", .serialized)
 struct MCPManagerToolExposureTests {
 
+    @MainActor
+    @Test("旧原生目录缓存不会恢复本机不支持的工具")
+    func testNativeCachedToolsRespectPlatformAvailability() {
+        let manager = MCPManager.shared
+        let server = MCPServerConfiguration(
+            id: UUID(),
+            displayName: "原生媒体目录缓存回归",
+            transport: .builtInAppTool(category: .mediaEnvironment),
+            isSelectedForChat: true
+        )
+        let originalServers = manager.servers
+        defer {
+            manager.servers = originalServers
+            manager.serverStatuses.removeValue(forKey: server.id)
+            manager.rebuildAggregates()
+        }
+        manager.servers.append(server)
+        var status = MCPServerStatus()
+        status.connectionState = .ready
+        status.isSelectedForChat = true
+        status.tools = MCPNativeMediaToolDefinitions.descriptions
+        manager.serverStatuses[server.id] = status
+        manager.rebuildAggregates()
+
+        let visibleIDs = Set(manager.status(for: server).tools.map(\.toolId))
+        #expect(visibleIDs.contains("weather.current"))
+        #expect(visibleIDs.contains("home.list_homes"))
+        #if os(watchOS)
+        #expect(visibleIDs.isDisjoint(with: ["speech.transcribe_file", "nfc.scan", "nfc.read_ndef", "nfc.write_ndef"]))
+        #else
+        #expect(visibleIDs.contains("speech.transcribe_file"))
+        #endif
+        #if targetEnvironment(simulator)
+        #expect(!visibleIDs.contains("nfc.scan"))
+        #endif
+
+        let routedIDs = Set(manager.routedTools.values.filter { $0.server.id == server.id }.map { $0.tool.toolId })
+        #expect(routedIDs == visibleIDs)
+    }
+
     @Test("MCP 默认超时为三分钟且最多重试三次")
     func testMCPRuntimeDefaultsUseThreeMinutesAndThreeRetries() {
         #expect(MCPRuntimeDefaults.requestTimeout == 180)
@@ -376,6 +416,7 @@ struct MCPManagerToolExposureTests {
             (server.id, MCPServerStore.loadMetadata(for: server.id))
         })
         let originalGlobalSwitch = manager.chatToolsEnabled
+        let originalStatuses = manager.serverStatuses
 
         defer {
             for server in MCPServerStore.loadServers() {
@@ -389,6 +430,7 @@ struct MCPManagerToolExposureTests {
             }
             manager.chatToolsEnabled = originalGlobalSwitch
             AppConfigStore.persistSynchronously(.bool(originalGlobalSwitch), for: .mcpChatToolsEnabled)
+            manager.serverStatuses = originalStatuses
             manager.reloadServers()
         }
 
@@ -402,6 +444,8 @@ struct MCPManagerToolExposureTests {
         let conversationServer = MCPBuiltInAppToolServer.defaultConfiguration(for: .conversation)
         let linuxServer = MCPBuiltInAppToolServer.defaultConfiguration(for: .linux)
         for server in [browserServer, conversationServer, linuxServer] {
+            // 直接写入存储的目录需要从新状态加载，不能复用单例中已有的 ready 连接目录。
+            manager.serverStatuses.removeValue(forKey: server.id)
             let category = try #require(MCPBuiltInAppToolServer.category(for: server.id))
             MCPServerStore.save(server)
             MCPServerStore.saveMetadata(

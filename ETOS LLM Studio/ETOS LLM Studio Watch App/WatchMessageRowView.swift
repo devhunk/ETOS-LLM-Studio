@@ -27,6 +27,7 @@ struct WatchMessageRowView: View {
     let isSelected: Bool
     let onToggleSelection: () -> Void
     let onOpenMore: () -> Void
+    let onOpenFullContent: (ChatMessage) -> Void
 
     private var message: ChatMessage {
         state.message
@@ -44,10 +45,6 @@ struct WatchMessageRowView: View {
             get: { viewModel.toolCallsExpandedState[message.id, default: false] },
             set: { viewModel.toolCallsExpandedState[message.id] = $0 }
         )
-    }
-
-    private var showsStreamingIndicators: Bool {
-        viewModel.isSendingMessage && viewModel.latestAssistantMessageID == message.id
     }
 
     private var hasActivePermission: Bool {
@@ -97,7 +94,8 @@ struct WatchMessageRowView: View {
             enableAdvancedRenderer: viewModel.enableAdvancedRenderer,
             enableExperimentalToolResultDisplay: true,
             enableMathRendering: viewModel.isMathRenderingEnabled(for: message.id),
-            showsStreamingIndicators: showsStreamingIndicators,
+            isCurrentResponse: viewModel.isSendingMessage
+                && viewModel.latestAssistantMessageID == state.id,
             mergeWithPrevious: mergeWithPrevious,
             mergeWithNext: mergeWithNext,
             messageActionBarContinuesToNext: messageActionBarContinuesToNext,
@@ -132,6 +130,7 @@ struct WatchMessageRowView: View {
             isSelected: isSelected,
             onToggleSelection: onToggleSelection,
             onOpenMore: hasActivePermission ? nil : onOpenMore,
+            onOpenFullContent: hasActivePermission ? nil : onOpenFullContent,
             sourceConversationName: message.sourceSessionID.flatMap { sourceSessionID in
                 viewModel.chatSessions.first(where: { $0.id == sourceSessionID })?.name
             },

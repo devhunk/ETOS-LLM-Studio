@@ -10,7 +10,7 @@
 import Foundation
 
 final class LocalLinuxTerminalScreen: @unchecked Sendable {
-    private struct Cell: Equatable {
+    struct Cell: Equatable {
         var text = ""
         var isContinuation = false
         var style = LocalLinuxTerminalStyle.default
@@ -51,12 +51,13 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
         case ignoredStringEscape
     }
 
-    private let scrollbackLimit: Int
     private var columns: Int
     private var rows: Int
     private var primary: Buffer
     private var alternate: Buffer
-    private var scrollback: [LocalLinuxTerminalLinePresentation] = []
+    private var scrollback: LocalLinuxTerminalHistory
+    private let primaryDisplayCache = LocalLinuxTerminalDisplayCache()
+    private let alternateDisplayCache = LocalLinuxTerminalDisplayCache()
     private var usesAlternateScreen = false
     private var usesAutoWrap = true
     private var usesInsertMode = false
@@ -71,7 +72,7 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
     init(columns: Int, rows: Int, scrollbackLimit: Int = 2_000) {
         self.columns = max(1, columns)
         self.rows = max(1, rows)
-        self.scrollbackLimit = max(0, scrollbackLimit)
+        scrollback = LocalLinuxTerminalHistory(capacity: scrollbackLimit)
         primary = Buffer(columns: self.columns, rows: self.rows)
         alternate = Buffer(columns: self.columns, rows: self.rows)
     }
@@ -111,39 +112,26 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
         maximumLines: Int? = nil,
         appearance: LocalLinuxTerminalAppearance = .dark
     ) -> LocalLinuxTerminalPresentation {
-        var values = usesAlternateScreen ? [] : scrollback
-        values.append(contentsOf: activeBuffer.lines.map(renderedLine))
-        while values.last?.isEmpty == true {
-            values.removeLast()
-        }
-        if let maximumLines {
-            values = Array(values.suffix(max(1, maximumLines)))
-        }
-        var plainText = ""
-        var attributedText = AttributedString()
-        for (index, line) in values.enumerated() {
-            if index != 0 {
-                plainText.append("\n")
-                attributedText.append(AttributedString("\n"))
-            }
-            plainText.append(line.plainText)
-            attributedText.append(line.attributedText(for: appearance))
-        }
-        return LocalLinuxTerminalPresentation(
-            plainText: plainText,
-            attributedText: attributedText
+        LocalLinuxTerminalPresentation(lines: renderedDisplayLines(maximumLines: maximumLines, appearance: appearance))
+    }
+
+    func renderedDisplayLines(
+        maximumLines: Int? = nil,
+        appearance: LocalLinuxTerminalAppearance = .dark
+    ) -> [LocalLinuxTerminalDisplayLine] {
+        let cache = usesAlternateScreen ? alternateDisplayCache : primaryDisplayCache
+        return cache.render(
+            screen: activeBuffer.lines,
+            history: scrollback.prefix(usesAlternateScreen ? 0 : scrollback.count),
+            maximumLines: maximumLines,
+            appearance: appearance,
+            visibleEnd: visibleCellEndIndex,
+            renderLine: renderedLine
         )
     }
 
     private var activeBuffer: Buffer {
-        get { usesAlternateScreen ? alternate : primary }
-        set {
-            if usesAlternateScreen {
-                alternate = newValue
-            } else {
-                primary = newValue
-            }
-        }
+        usesAlternateScreen ? alternate : primary
     }
 
     private func consume(_ byte: UInt8) {
@@ -558,50 +546,50 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
     }
 
     private func put(_ character: Character) {
-        var buffer = activeBuffer
-        if buffer.pendingWrap {
-            buffer.pendingWrap = false
-            if usesAutoWrap {
+        mutateBuffer { buffer in
+            if buffer.pendingWrap {
+                buffer.pendingWrap = false
+                if usesAutoWrap {
+                    buffer.cursor.column = 0
+                    index(&buffer)
+                }
+            }
+
+            let width = characterWidth(character)
+            if width == 2, buffer.cursor.column == columns - 1, usesAutoWrap {
                 buffer.cursor.column = 0
                 index(&buffer)
             }
-        }
-
-        let width = characterWidth(character)
-        if width == 2, buffer.cursor.column == columns - 1, usesAutoWrap {
-            buffer.cursor.column = 0
-            index(&buffer)
-        }
-        let row = buffer.cursor.row
-        let column = buffer.cursor.column
-        if usesInsertMode {
-            let shift = min(width, columns - column)
-            if shift > 0 {
-                for target in stride(from: columns - 1, through: column + shift, by: -1) {
-                    buffer.lines[row][target] = buffer.lines[row][target - shift]
+            let row = buffer.cursor.row
+            let column = buffer.cursor.column
+            if usesInsertMode {
+                let shift = min(width, columns - column)
+                if shift > 0 {
+                    for target in stride(from: columns - 1, through: column + shift, by: -1) {
+                        buffer.lines[row][target] = buffer.lines[row][target - shift]
+                    }
                 }
             }
-        }
-        buffer.lines[row][column] = Cell(
-            text: String(character),
-            isContinuation: false,
-            style: currentStyle
-        )
-        if width == 2, column + 1 < columns {
-            buffer.lines[row][column + 1] = Cell(
-                text: "",
-                isContinuation: true,
+            buffer.lines[row][column] = Cell(
+                text: String(character),
+                isContinuation: false,
                 style: currentStyle
             )
+            if width == 2, column + 1 < columns {
+                buffer.lines[row][column + 1] = Cell(
+                    text: "",
+                    isContinuation: true,
+                    style: currentStyle
+                )
+            }
+            let next = column + width
+            if next >= columns {
+                buffer.cursor.column = columns - 1
+                buffer.pendingWrap = usesAutoWrap
+            } else {
+                buffer.cursor.column = next
+            }
         }
-        let next = column + width
-        if next >= columns {
-            buffer.cursor.column = columns - 1
-            buffer.pendingWrap = usesAutoWrap
-        } else {
-            buffer.cursor.column = next
-        }
-        activeBuffer = buffer
     }
 
     private func lineFeed() {
@@ -766,7 +754,7 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
             let removed = buffer.lines.remove(at: buffer.scrollTop)
             buffer.lines.insert(blankLine(), at: buffer.scrollBottom)
             if !usesAlternateScreen && buffer.scrollTop == 0 && buffer.scrollBottom == rows - 1 {
-                appendScrollback(renderedLine(removed))
+                scrollback.append(renderedLine(removed))
             }
         }
     }
@@ -848,7 +836,7 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
         if lines.count > targetRows {
             let removed = lines.prefix(lines.count - targetRows)
             if preservesHistory {
-                removed.map(renderedLine).forEach(appendScrollback)
+                for line in removed { scrollback.append(renderedLine(line)) }
             }
             lines.removeFirst(lines.count - targetRows)
         } else if lines.count < targetRows {
@@ -874,9 +862,13 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
     }
 
     private func mutateBuffer(_ mutation: (inout Buffer) -> Void) {
-        var buffer = activeBuffer
-        mutation(&buffer)
-        activeBuffer = buffer
+        // 直接借用当前缓冲区，避免局部副本与原值同时持有嵌套数组，
+        // 导致每写一个字符都触发屏幕数组和当前行的写时复制。
+        if usesAlternateScreen {
+            mutation(&alternate)
+        } else {
+            mutation(&primary)
+        }
     }
 
     private func blankLine() -> [Cell] {
@@ -948,14 +940,6 @@ final class LocalLinuxTerminalScreen: @unchecked Sendable {
             end -= 1
         }
         return end
-    }
-
-    private func appendScrollback(_ line: LocalLinuxTerminalLinePresentation) {
-        guard scrollbackLimit > 0 else { return }
-        scrollback.append(line)
-        if scrollback.count > scrollbackLimit {
-            scrollback.removeFirst(scrollback.count - scrollbackLimit)
-        }
     }
 
     private func characterWidth(_ character: Character) -> Int {

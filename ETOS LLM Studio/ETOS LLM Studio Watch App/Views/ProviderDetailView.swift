@@ -22,6 +22,7 @@ struct ProviderDetailView: View {
     let allowsManualModelAdd: Bool
     @State private var isApplyingProviderUpdateFromParent = false
     @State private var isAddingModel = false
+    @State private var isShowingModelTest = false
     @State private var isFetchingModels = false
     @State private var isShowingFetchProgress = false
     @State private var fetchError: String?
@@ -102,23 +103,6 @@ struct ProviderDetailView: View {
                 }
             }
 
-            if allowsModelTesting {
-                Section {
-                    NavigationLink {
-                        ModelConnectivityTestView(provider: provider)
-                    } label: {
-                        Label(
-                            NSLocalizedString("模型测试", comment: "Model connectivity test entry"),
-                            systemImage: "checkmark.seal"
-                        )
-                    }
-                } footer: {
-                    Text(NSLocalizedString("模型测试会按用途向每个已添加模型发送真实请求，用于确认 API Key、地址、模型 ID 和响应格式是否可用。", comment: "Watch model test explanation"))
-                        .etFont(.footnote)
-                        .foregroundColor(.secondary)
-                }
-            }
-
             if groupByFamilySection {
                 let activeSections = sections(forActive: true)
                 let inactiveSections = sections(forActive: false)
@@ -166,33 +150,11 @@ struct ProviderDetailView: View {
             hasAutoFetchedModels = true
             await fetchAndMergeModels(showsProgress: false)
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                if allowsManualModelAdd {
-                    Button(action: { isAddingModel = true }) {
-                        Image(systemName: "plus")
-                    }
-                }
-            }
-
-            ToolbarItem(placement: .bottomBar) {
-                HStack {
-                    if allowsRemoteModelFetch {
-                        Button(action: { Task { await fetchAndMergeModels(showsProgress: true) } }) {
-                            Image(systemName: "icloud.and.arrow.down")
-                        }
-                        .disabled(isFetchingModels)
-                    }
-                    Spacer()
-                    Button(action: { toggleSearch() }) {
-                        Image(systemName: isSearchPresented ? "xmark" : "magnifyingglass")
-                    }
-                    .accessibilityLabel(isSearchPresented ? NSLocalizedString("取消搜索", comment: "") : NSLocalizedString("搜索模型", comment: ""))
-                }
-            }
-        }
         .sheet(isPresented: $isAddingModel) {
             ModelAddView(provider: $provider)
+        }
+        .navigationDestination(isPresented: $isShowingModelTest) {
+            ModelConnectivityTestView(provider: provider)
         }
         .onChange(of: provider) {
             guard !isApplyingProviderUpdateFromParent else { return }
@@ -206,6 +168,119 @@ struct ProviderDetailView: View {
         } message: {
             Text(fetchError ?? NSLocalizedString("发生未知错误。", comment: ""))
         }
+        .guidePageContext(
+            descriptor: GuidePageDescriptor(
+                id: providerModelsGuidePageID,
+                title: provider.name,
+                documents: [GuideDocumentReference(id: "provider-model-basics", title: "Provider and Model Basics")],
+                tools: allowsManualModelAdd
+                    ? [GuidePageTool(definition: GuideToolCatalog.updateProviderModels, access: .proposeChange)]
+                    : []
+            ),
+            snapshot: providerModelsGuideSnapshot,
+            buildProposal: buildProviderModelsGuideProposal,
+            execute: executeProviderModelsGuideProposal
+        )
+        .watchGuideEntry(actions: pageActions)
+    }
+
+    private var pageActions: [WatchPageAction] {
+        var actions: [WatchPageAction] = []
+        if allowsManualModelAdd {
+            actions.append(WatchPageAction(title: NSLocalizedString("添加模型", value: "Add Model", comment: "手表模型列表添加操作"), systemImage: "plus") {
+                isAddingModel = true
+            })
+        }
+        if allowsRemoteModelFetch {
+            actions.append(WatchPageAction(
+                title: NSLocalizedString("在线获取模型列表", value: "Fetch Models Online", comment: "手表模型列表获取操作"),
+                systemImage: "icloud.and.arrow.down",
+                isEnabled: !isFetchingModels
+            ) {
+                Task { await fetchAndMergeModels(showsProgress: true) }
+            })
+        }
+        actions.append(WatchPageAction(
+            title: isSearchPresented
+                ? NSLocalizedString("取消搜索", value: "Cancel Search", comment: "手表模型列表取消搜索")
+                : NSLocalizedString("搜索模型", value: "Search Models", comment: "手表模型列表搜索操作"),
+            systemImage: isSearchPresented ? "xmark" : "magnifyingglass",
+            perform: toggleSearch
+        ))
+        if allowsModelTesting {
+            actions.append(WatchPageAction(
+                title: NSLocalizedString("模型测试", value: "Model Test", comment: "提供商模型批量测试入口"),
+                systemImage: "checkmark.seal"
+            ) {
+                // 共用菜单会先关闭再执行导航，测试请求仍由测试页的开始按钮触发。
+                isShowingModelTest = true
+            })
+        }
+        return actions
+    }
+
+    private var providerModelsGuidePageID: GuidePageID {
+        GuidePageID(rawValue: "watch-provider-models-\(provider.id)")
+    }
+
+    private func providerModelsGuideSnapshot() async -> GuidePageSnapshot {
+        GuidePageSnapshot(fields: [
+            "name": GuideSnapshotField(
+                label: NSLocalizedString("提供商名称", comment: "手表提供商模型页向导快照字段"),
+                value: .string(provider.name),
+                access: .readOnly
+            ),
+            "base_url": GuideSnapshotField(
+                label: NSLocalizedString("API 地址", comment: "手表提供商模型页向导快照字段"),
+                value: .string(provider.baseURL),
+                access: .readOnly
+            ),
+            "api_format": GuideSnapshotField(
+                label: NSLocalizedString("API 格式", comment: "手表提供商模型页向导快照字段"),
+                value: .string(provider.apiFormat),
+                access: .readOnly
+            ),
+            "models": GuideSnapshotField(
+                label: NSLocalizedString("已添加模型", comment: "手表提供商模型页向导快照字段"),
+                value: GuideProviderModelsProposalSupport.snapshotValue(for: provider.models)
+            )
+        ])
+    }
+
+    private func buildProviderModelsGuideProposal(
+        call: InternalToolCall,
+        snapshot: GuidePageSnapshot
+    ) throws -> GuideActionProposal {
+        _ = snapshot
+        guard allowsManualModelAdd else { throw GuideError.unsupportedTool(call.toolName) }
+        return try GuideProviderModelsProposalSupport.buildProposal(
+            call: call,
+            pageID: providerModelsGuidePageID,
+            provider: provider
+        )
+    }
+
+    private func executeProviderModelsGuideProposal(
+        _ proposal: GuideActionProposal
+    ) async throws -> GuideActionExecution {
+        guard allowsManualModelAdd else { throw GuideError.unsupportedTool(proposal.toolName) }
+        let application = try GuideProviderModelsProposalSupport.apply(proposal, to: provider)
+
+        // 显式持久化确认后的完整结果，并暂时抑制 @State 变化触发的重复保存。
+        isApplyingProviderUpdateFromParent = true
+        provider = application.provider
+        var providerToSave = application.provider
+        providerToSave.models = application.provider.models.filter(\.isActivated)
+        ChatService.shared.saveProviderFromManagement(providerToSave)
+        onSave(providerToSave)
+        DispatchQueue.main.async {
+            isApplyingProviderUpdateFromParent = false
+        }
+
+        return GuideActionExecution(
+            message: NSLocalizedString("已保存提供商模型配置。", comment: "提供商模型向导执行结果"),
+            undoProposal: application.undoProposal
+        )
     }
     
     private func fetchAndMergeModels(showsProgress: Bool) async {

@@ -10,12 +10,14 @@ import Combine
 import ETOSCore
 
 struct ContentView: View {
+    @Environment(\.displayScale) var displayScale
     @Environment(\.scenePhase) var scenePhase
 
     @Environment(\.colorScheme) var colorScheme
     @Environment(\.accessibilityReduceMotion) var accessibilityReduceMotion
     @EnvironmentObject var launchStateMachine: AppLaunchStateMachine
     @StateObject var viewModel = ChatViewModel()
+    @StateObject var guideController = GuideConversationController(historyStore: .contextualHelp)
     @StateObject var announcementManager = AnnouncementManager.shared
     @StateObject var surveyManager = SurveyManager.shared
     @StateObject var legacyJSONMigrationManager = LegacyJSONMigrationManager.shared
@@ -30,6 +32,7 @@ struct ContentView: View {
     @State var settingsDestination: WatchSettingsNavigationDestination?
     @State var isSessionListPresented = false
     @State var messageActionsTarget: WatchMessageActionsNavigationTarget?
+    @State var fullMessageContentTarget: ChatMessage?
     @State var messageRewriteTarget: WatchMessageRewriteNavigationTarget?
     @State var isMessageSelectionMode = false
     @State var selectedMessageIDs: Set<UUID> = []
@@ -57,7 +60,9 @@ struct ContentView: View {
     @State var launchRecoveryNoticeMessage: String?
     @State var launchRecoveryRequest: Persistence.LaunchRecoveryRequest?
     @State var launchRecoveryErrorMessage: String?
+    @Environment(\.sizeCategory) var sizeCategory
     @State var rootBodyFont: Font = .body
+    @State var rootFontPreparationTask: Task<Void, Never>?
     @State var legacyMigrationErrorMessage: String?
     @State var didEnterBackgroundSinceLastActivation = false
     @State var isRequestControlsPresented = false
@@ -109,6 +114,7 @@ struct ContentView: View {
             NavigationStack {
                 legacyChatRootView
             }
+            .environmentObject(guideController)
             .onReceive(NotificationCenter.default.publisher(for: .requestOpenDailyPulse)) { _ in
                 openDailyPulse()
             }
@@ -182,6 +188,9 @@ struct ContentView: View {
             showChatTransientNotice(.copyCompleted, duration: .seconds(1.4))
         }
         .environment(\.font, rootBodyFont)
+        .onChange(of: sizeCategory) { _, _ in
+            refreshRootBodyFont()
+        }
         .environment(\.locale, AppLanguagePreference.preferredLocale(rawValue: appConfig.appLanguage))
         .onAppear {
             AppLanguageRuntime.apply(rawValue: appConfig.appLanguage)
@@ -199,6 +208,7 @@ struct ContentView: View {
             FontLibrary.preloadRuntimeCacheAsync(forceReload: true)
             refreshRootBodyFont()
         }
+        .localLinuxDiagnosticFeedback(blocked: watchToolPermissionAutoPresentationBlocked || toolPermissionCenter.activeRequest != nil)
         .onChange(of: appConfig.fontFallbackScope) { _, _ in
             refreshRootBodyFont()
         }
@@ -304,6 +314,9 @@ struct ContentView: View {
                     didEnterBackgroundSinceLastActivation = false
                 }
             case .background:
+                Task {
+                    await guideController.persistHistory()
+                }
                 TTSManager.shared.setApplicationIsInBackground(true)
                 appLockManager.handleSceneDidEnterBackground()
                 ChatService.recordAppDidEnterBackground()

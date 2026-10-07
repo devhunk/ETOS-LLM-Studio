@@ -128,6 +128,7 @@ public actor LocalLinuxStorageManager {
     private static let receiptPrefix = "format=ish-rootfs-install-v1\nseed_archive_sha256="
     private static let damageMarkerName = "ETOS-System-Damaged.txt"
     private let fileManager: FileManager
+    private nonisolated let workspaceSizeRefresher: LocalLinuxWorkspaceSizeRefresher
     public nonisolated let layout: LocalLinuxStorageLayout
 
     public init(
@@ -136,6 +137,10 @@ public actor LocalLinuxStorageManager {
         appGroupLayout: ETOSSharedStorageLayout? = .resolve()
     ) {
         self.fileManager = fileManager
+        workspaceSizeRefresher = LocalLinuxWorkspaceSizeRefresher(
+            // 后台扫描自建 FileManager，避免跨隔离域捕获调用方可能带 delegate 的实例。
+            measure: { directory in Self.directorySize(at: directory, fileManager: FileManager()) }
+        )
         layout = LocalLinuxStorageLayout(
             documentsDirectory: documentsDirectory,
             sharedDirectory: appGroupLayout?.shared,
@@ -376,7 +381,7 @@ public actor LocalLinuxStorageManager {
         return workspace
     }
 
-    public func hostURL(for workspace: LocalAgentWorkspace) throws -> URL {
+    public nonisolated func hostURL(for workspace: LocalAgentWorkspace) throws -> URL {
         let candidate = layout.root.appendingPathComponent(workspace.hostRelativePath, isDirectory: true)
         return try checkedDescendant(candidate, of: layout.workspaces)
     }
@@ -563,14 +568,26 @@ public actor LocalLinuxStorageManager {
         )
     }
 
-    public func refreshWorkspaceSize(_ workspace: LocalAgentWorkspace) throws -> LocalAgentWorkspace {
-        var updated = workspace
-        updated.sizeBytes = directorySize(at: try hostURL(for: workspace))
-        guard Persistence.saveLocalAgentWorkspace(updated) else {
+    nonisolated func scheduleWorkspaceSizeRefresh(_ workspace: LocalAgentWorkspace) {
+        // Shell/PTY 即使失败也可能已经写入 Shared；同步不依赖工作区统计能否落库。
+        ETOSSharedWorkspaceFiles.notifyChange()
+        guard let directory = try? hostURL(for: workspace),
+              let persist = Persistence.makeLocalAgentWorkspaceSizeWriter() else { return }
+        Task { [workspaceSizeRefresher] in
+            await workspaceSizeRefresher.schedule(workspace, directory: directory, persist: persist)
+        }
+    }
+
+    public func refreshWorkspaceSize(_ workspace: LocalAgentWorkspace) async throws -> LocalAgentWorkspace {
+        guard let persist = Persistence.makeLocalAgentWorkspaceSizeWriter() else {
             throw LocalLinuxRuntimeError.runtimeUnavailable(
-                NSLocalizedString("无法更新 Linux 工作区统计。", comment: "Update Linux workspace size failure")
+                NSLocalizedString("无法更新 Linux 工作区统计。", comment: "更新 Linux 工作区统计失败")
             )
         }
+        var updated = workspace
+        updated.sizeBytes = try await workspaceSizeRefresher.refresh(
+            workspace, directory: hostURL(for: workspace), persist: persist
+        )
         return updated
     }
 
@@ -591,6 +608,7 @@ public actor LocalLinuxStorageManager {
             guard !relativePath.isEmpty else { continue }
             try archive.addEntry(with: relativePath, fileURL: item, compressionMethod: .deflate)
         }
+        ETOSSharedWorkspaceFiles.notifyChange()
         return archiveURL
     }
 
@@ -607,6 +625,9 @@ public actor LocalLinuxStorageManager {
     }
 
     public func deleteSystem(deleteUserData: Bool) throws {
+        defer {
+            if deleteUserData { ETOSSharedWorkspaceFiles.notifyChange() }
+        }
         if fileManager.fileExists(atPath: layout.system.path) {
             try fileManager.removeItem(at: layout.system)
         }
@@ -678,7 +699,7 @@ public actor LocalLinuxStorageManager {
         return directory
     }
 
-    private func checkedDescendant(_ candidate: URL, of parent: URL) throws -> URL {
+    private nonisolated func checkedDescendant(_ candidate: URL, of parent: URL) throws -> URL {
         let resolvedCandidate = candidate.standardizedFileURL
         let resolvedParent = parent.standardizedFileURL
         let prefix = resolvedParent.path.hasSuffix("/") ? resolvedParent.path : resolvedParent.path + "/"
@@ -689,6 +710,10 @@ public actor LocalLinuxStorageManager {
     }
 
     private func directorySize(at directory: URL) -> UInt64 {
+        Self.directorySize(at: directory, fileManager: fileManager)
+    }
+
+    private nonisolated static func directorySize(at directory: URL, fileManager: FileManager) -> UInt64 {
         guard let enumerator = fileManager.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .totalFileAllocatedSizeKey],

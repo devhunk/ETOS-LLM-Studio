@@ -12,6 +12,43 @@ import GRDB
 @testable import ETOSCore
 
 extension PersistenceTests {
+    @Test("提供商和模型适配器切换按最终格式收回缓存价格")
+    func cachePricingFollowsEffectiveAdapterWhenSaving() throws {
+        let pricing = ModelPricing(cacheWritePerMillionTokens: 3.75, cacheWriteOneHourPerMillionTokens: 6)
+        var provider = Provider(
+            name: "缓存价格适配器回归", baseURL: "https://example.com", apiKeys: [], apiFormat: "anthropic",
+            models: [
+                Model(modelName: "inherited", pricing: pricing),
+                Model(modelName: "overridden-anthropic", apiFormatOverride: "anthropic", pricing: pricing),
+                Model(modelName: "overridden-openai", apiFormatOverride: "openai-compatible", pricing: pricing)
+            ]
+        )
+        defer { ConfigLoader.deleteProvider(provider) }
+        ConfigLoader.saveProvider(provider)
+        var restored = try #require(ConfigLoader.loadProviders().first { $0.id == provider.id })
+        #expect(restored.models[0].pricing?.cacheWriteOneHourPerMillionTokens == 6)
+        #expect(restored.models[1].pricing?.cacheWriteOneHourPerMillionTokens == 6)
+        #expect(restored.models[2].pricing?.cacheWriteOneHourPerMillionTokens == nil)
+
+        provider = restored
+        provider.apiFormat = "openai-compatible"
+        ConfigLoader.saveProvider(provider)
+        restored = try #require(ConfigLoader.loadProviders().first { $0.id == provider.id })
+        #expect(restored.models[0].pricing?.cacheWritePerMillionTokens == 3.75)
+        #expect(restored.models[0].pricing?.cacheWriteOneHourPerMillionTokens == nil)
+        #expect(restored.models[1].pricing?.cacheWriteOneHourPerMillionTokens == 6)
+
+        restored.models[1].apiFormatOverride = nil
+        ConfigLoader.saveProvider(restored)
+        restored = try #require(ConfigLoader.loadProviders().first { $0.id == provider.id })
+        #expect(restored.models[1].pricing?.cacheWriteOneHourPerMillionTokens == nil)
+        restored.apiFormat = "anthropic"
+        ConfigLoader.saveProvider(restored)
+        restored = try #require(ConfigLoader.loadProviders().first { $0.id == provider.id })
+        #expect(restored.models.allSatisfy { $0.pricing?.cacheWriteOneHourPerMillionTokens == nil })
+        #expect(restored.models.allSatisfy { $0.pricing?.cacheWritePerMillionTokens == 3.75 })
+    }
+
     private struct LegacyProviderSnapshot: Encodable {
         let id: UUID
         let name: String
@@ -89,6 +126,28 @@ extension PersistenceTests {
         #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? String == "/bin/bash")
     }
 
+    @Test("新挂载权限默认只读并使用本机数据库配置")
+    @MainActor
+    func localLinuxDefaultMountAccessPersistsLocally() {
+        let key = AppConfigKey.localLinuxDefaultMountAccess
+        let previousValue = AppConfigStore.shared.localLinuxDefaultMountAccess
+
+        defer {
+            AppConfigStore.shared.localLinuxDefaultMountAccess = previousValue
+        }
+
+        #expect(key.defaultValue == .text(LocalLinuxMountAccess.readOnly.rawValue))
+        #expect(key.participatesInSync == false)
+
+        AppConfigStore.shared.localLinuxDefaultMountAccess = .readWrite
+
+        #expect(AppConfigStore.shared.localLinuxDefaultMountAccess == .readWrite)
+        #expect(
+            AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? String
+                == LocalLinuxMountAccess.readWrite.rawValue
+        )
+    }
+
     @Test("iOS 与 watchOS 默认使用按提供商选择模型")
     func modelPickerDefaultsToProviderGrouping() {
         #expect(AppConfigKey.iOSModelPickerGroupsByProvider.defaultValue == .bool(true))
@@ -133,13 +192,16 @@ extension PersistenceTests {
         #expect(AppConfigKey.watchModelPickerExpandedGroupIDs.participatesInSync == false)
     }
 
-    @Test("液态玻璃底色默认兼顾透明感与复杂背景可读性")
+    @Test("液态玻璃底色默认保持三成且允许调至完全不透明")
     func liquidGlassTintDefaultsAndClamps() {
         #expect(AppConfigKey.liquidGlassTintOpacity.defaultValue == .real(0.3))
         #expect(AppConfigKey.liquidGlassTintOpacity.participatesInSync)
         #expect(LiquidGlassTintSetting.normalized(.nan) == LiquidGlassTintSetting.defaultOpacity)
         #expect(LiquidGlassTintSetting.normalized(-1) == LiquidGlassTintSetting.minimumOpacity)
-        #expect(LiquidGlassTintSetting.normalized(1) == LiquidGlassTintSetting.maximumOpacity)
+        #expect(LiquidGlassTintSetting.normalized(0.6) == 0.6)
+        #expect(LiquidGlassTintSetting.normalized(0.8) == 0.8)
+        #expect(LiquidGlassTintSetting.normalized(1) == 1)
+        #expect(LiquidGlassTintSetting.normalized(1.5) == 1)
     }
 
     @Test("AppConfig 迁移标记已存在时仍补写缺失的专用模型键")

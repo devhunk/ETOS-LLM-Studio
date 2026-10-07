@@ -15,6 +15,7 @@ extension GeminiAdapter {
     
     public func buildChatRequest(for model: RunnableModel, commonPayload: [String: Any], messages: [ChatMessage], tools: [InternalToolDefinition]?, audioAttachments: [UUID: AudioAttachment], imageAttachments: [UUID: [ImageAttachment]], fileAttachments: [UUID: [FileAttachment]]) -> URLRequest? {
         let reasoningContentEchoMode = resolvedReasoningContentEchoMode(from: commonPayload)
+        let suppressesRequestLog = commonPayload[requestLogSuppressionControlKey] as? Bool ?? false
         guard let baseURL = normalizedGeminiBaseURL(from: model.provider.baseURL) else {
             logger.error("构建聊天请求失败: 无效的 API 基础 URL - \(model.provider.baseURL)")
             return nil
@@ -22,7 +23,8 @@ extension GeminiAdapter {
         
         let controlledAPIKey = commonPayload[Self.apiKeyControlKey] as? String
         guard let apiKey = controlledAPIKey.flatMap({ $0.isEmpty ? nil : $0 })
-            ?? model.provider.apiKeys.randomElement(),
+            ?? (commonPayload[providerAPIKeyControlKey] as? String)
+            ?? model.provider.nextAPIKey(),
               !apiKey.isEmpty else {
             logger.error("构建聊天请求失败: 提供商 '\(model.provider.name)' 未配置有效的 API Key。")
             return nil
@@ -37,20 +39,20 @@ extension GeminiAdapter {
         )
         var chatURL = baseURL.appendingPathComponent("models/\(requestModelName):\(action)")
         
-        // Gemini 使用 URL 参数传递 API Key
-        var urlComponents = URLComponents(url: chatURL, resolvingAgainstBaseURL: false)!
-        var queryItems = urlComponents.queryItems ?? []
-        queryItems.append(URLQueryItem(name: "key", value: apiKey))
         if isStreaming {
+            var urlComponents = URLComponents(url: chatURL, resolvingAgainstBaseURL: false)!
+            var queryItems = urlComponents.queryItems ?? []
             queryItems.append(URLQueryItem(name: "alt", value: "sse"))
+            urlComponents.queryItems = queryItems
+            chatURL = urlComponents.url!
         }
-        urlComponents.queryItems = queryItems
-        chatURL = urlComponents.url!
         
         var request = URLRequest(url: chatURL)
         request.timeoutInterval = 600
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // 密钥使用官方认证请求头，避免随 URL 出现在访问日志中；自定义请求头仍可覆盖默认值。
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         applyHeaderOverrides(model.provider.headerOverrides, apiKey: apiKey, to: &request)
         
         // 分离系统消息和普通消息
@@ -266,11 +268,14 @@ extension GeminiAdapter {
         }
         
         payload = mergedRequestPayload(payload, with: overrides)
+        payload.removeValue(forKey: requestLogSuppressionControlKey)
 
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
             logger.debug("已构建 Gemini 聊天请求体，共 \(request.httpBody?.count ?? 0) 字节。")
-            logChatRequestSnapshot(adapterName: "Gemini", request: request, payload: payload)
+            if !suppressesRequestLog {
+                logChatRequestSnapshot(adapterName: "Gemini", request: request, payload: payload)
+            }
         } catch {
             logger.error("构建聊天请求失败: JSON 序列化错误 - \(error.localizedDescription)")
             return nil
@@ -285,18 +290,16 @@ extension GeminiAdapter {
             return nil
         }
         
-        guard let apiKey = provider.apiKeys.randomElement(), !apiKey.isEmpty else {
+        guard let apiKey = provider.nextAPIKey(), !apiKey.isEmpty else {
             logger.error("构建模型列表请求失败: 提供商 '\(provider.name)' 未配置有效的 API Key。")
             return nil
         }
         
-        var modelsURL = baseURL.appendingPathComponent("models")
-        var urlComponents = URLComponents(url: modelsURL, resolvingAgainstBaseURL: false)!
-        urlComponents.queryItems = [URLQueryItem(name: "key", value: apiKey)]
-        modelsURL = urlComponents.url!
+        let modelsURL = baseURL.appendingPathComponent("models")
         
         var request = URLRequest(url: modelsURL)
         request.httpMethod = "GET"
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         applyHeaderOverrides(provider.headerOverrides, apiKey: apiKey, to: &request)
         return request
     }
@@ -507,7 +510,7 @@ extension GeminiAdapter {
             return nil
         }
         
-        guard let apiKey = model.provider.apiKeys.randomElement(), !apiKey.isEmpty else {
+        guard let apiKey = model.provider.nextAPIKey(), !apiKey.isEmpty else {
             logger.error("构建嵌入请求失败: 提供商 '\(model.provider.name)' 缺少有效的 API Key")
             return nil
         }
@@ -518,15 +521,13 @@ extension GeminiAdapter {
             for: model,
             overrides: model.effectiveOverrideParameters.mapValues { $0.toAny() }
         )
-        var embeddingsURL = baseURL.appendingPathComponent("models/\(requestModelName):\(action)")
-        var urlComponents = URLComponents(url: embeddingsURL, resolvingAgainstBaseURL: false)!
-        urlComponents.queryItems = [URLQueryItem(name: "key", value: apiKey)]
-        embeddingsURL = urlComponents.url!
+        let embeddingsURL = baseURL.appendingPathComponent("models/\(requestModelName):\(action)")
         
         var request = URLRequest(url: embeddingsURL)
         request.httpMethod = "POST"
         request.timeoutInterval = 300
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         applyHeaderOverrides(model.provider.headerOverrides, apiKey: apiKey, to: &request)
         
         var payload: [String: Any]

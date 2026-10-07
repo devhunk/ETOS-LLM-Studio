@@ -22,6 +22,7 @@ struct WatchChatTranscriptImageConfiguration: Sendable {
     let inputPlaceholder: String
     let prefersDarkAppearance: Bool
     let appLanguage: String
+    let sizeCategory: ContentSizeCategory
     let backgroundImageURL: URL?
     let backgroundOpacity: Double
     let backgroundBlurRadius: Double
@@ -66,7 +67,8 @@ enum WatchChatTranscriptImageRenderer {
         try Task.checkCancellation()
 
         let rows = preparedRows.map(WatchChatTranscriptRenderRow.init)
-        let rootFont = AppFontAdapter.adaptedFont(from: .body)
+        let rootFont = await AppFontAdapter.adaptedFont(from: .body, sizeCategory: configuration.sizeCategory)
+        let fontPreparation = ETFontExportPreparation()
         let canvas = WatchChatTranscriptCanvas(
             rows: rows,
             continuationContext: preparedExport.continuationContext,
@@ -84,6 +86,8 @@ enum WatchChatTranscriptImageRenderer {
             AppLanguagePreference.preferredLocale(rawValue: configuration.appLanguage)
         )
         .environment(\.font, rootFont)
+        .environment(\.sizeCategory, configuration.sizeCategory)
+        .environment(\.etFontExportPreparation, fontPreparation)
         .frame(width: configuration.canvasWidth)
         .fixedSize(horizontal: false, vertical: true)
 
@@ -92,9 +96,12 @@ enum WatchChatTranscriptImageRenderer {
         renderer.isOpaque = true
 
         var measuredSize = CGSize.zero
-        renderer.render(rasterizationScale: 1) { size, _ in
-            measuredSize = size
-        }
+        repeat {
+            try Task.checkCancellation()
+            renderer.render(rasterizationScale: 1) { size, _ in
+                measuredSize = size
+            }
+        } while try await fontPreparation.preparePendingFonts()
         guard measuredSize.width > 0, measuredSize.height > 0 else {
             throw ChatTranscriptExportError.imageRenderFailed
         }
@@ -184,6 +191,9 @@ enum WatchChatTranscriptImageRenderer {
             }
         }
 
+        let versionIndex = await Task.detached(priority: .userInitiated) {
+            ChatResponseAttemptSupport.versionInfoByMessageID(in: sourceMessages)
+        }.value
         return displayedMessages.indices.map { index in
             let message = displayedMessages[index]
             let visualMessage = visualMessages[index]
@@ -219,10 +229,7 @@ enum WatchChatTranscriptImageRenderer {
                 connectsTimelineToNext: mergeWithNext
                     && hasTimelineContent(message)
                     && hasTimelineContent(next),
-                responseAttemptVersionInfo: ChatResponseAttemptSupport.versionInfo(
-                    for: message,
-                    in: sourceMessages
-                ),
+                responseAttemptVersionInfo: versionIndex[message.id],
                 canRetry: retryableMessageIDs.contains(message.id)
             )
         }
@@ -604,7 +611,7 @@ private struct WatchChatTranscriptBubbleRow: View {
             enableAdvancedRenderer: configuration.enableAdvancedRenderer,
             enableExperimentalToolResultDisplay: true,
             enableMathRendering: false,
-            showsStreamingIndicators: false,
+            isCurrentResponse: false,
             mergeWithPrevious: row.mergeWithPrevious,
             mergeWithNext: row.mergeWithNext,
             messageActionBarContinuesToNext: row.messageActionBarContinuesToNext,

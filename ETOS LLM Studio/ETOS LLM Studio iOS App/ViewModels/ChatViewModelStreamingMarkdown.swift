@@ -13,15 +13,14 @@ extension ChatViewModel {
     func isActivelyStreaming(_ message: ChatMessage) -> Bool {
         message.role == .assistant
             && isSendingMessage
-            && latestAssistantMessageID == message.id
+            && message.isReceivingStream
     }
 
     func canUseStreamingMarkdownFastPath(for message: ChatMessage) -> Bool {
         guard isActivelyStreaming(message) else { return false }
         let rules = MessageRegexRuleStore.shared.rules
         guard !Self.hasVisualRegexRule(in: rules, for: message) else { return false }
-        guard let sessionID = currentSession?.id else { return true }
-        return RoleplayStore.shared.binding(sessionID: sessionID)?.htmlRenderingEnabled != true
+        return !messageRenderConfiguration.rendersHTML
     }
 
     func scheduleStreamingMarkdownPreparation(
@@ -72,6 +71,8 @@ extension ChatViewModel {
     func finalizeStreamingMarkdownIfNeeded() {
         guard let messageID = latestAssistantMessageID,
               let state = messageStateByID[messageID] else { return }
+        guard state.streamingMarkdownState.contentSnapshot?.isFinal == false
+                || state.streamingMarkdownState.reasoningSnapshot?.isFinal == false else { return }
         let message = state.message
         state.streamingMarkdownState.beginStaticHandoff(channel: .content)
         state.streamingMarkdownState.beginStaticHandoff(channel: .reasoning)

@@ -54,16 +54,6 @@ extension ChatViewModel {
         }
     }
 
-    func setSelectedTTSModel(_ model: RunnableModel?) {
-        selectedTTSModel = model
-        let newIdentifier = model?.id ?? ""
-        persistSpecializedModelIdentifier(newIdentifier, for: .ttsModelIdentifier)
-        if ttsModelIdentifier != newIdentifier {
-            ttsModelIdentifier = newIdentifier
-        }
-        ttsManager.updateSelectedModel(model)
-    }
-
     func setSelectedEmbeddingModel(_ model: RunnableModel?) {
         selectedEmbeddingModel = model
         let newIdentifier = model?.id ?? ""
@@ -135,27 +125,6 @@ extension ChatViewModel {
         selectedSpeechModel = nil
         persistSpecializedModelIdentifier("", for: .speechModelIdentifier)
         speechModelIdentifier = ""
-    }
-
-    func syncTTSModelSelection() {
-        if let match = ttsModels.first(where: { $0.id == ttsModelIdentifier }) {
-            selectedTTSModel = match
-            ttsManager.updateSelectedModel(match)
-            return
-        }
-
-        guard !ttsModelIdentifier.isEmpty else {
-            selectedTTSModel = nil
-            ttsManager.updateSelectedModel(nil)
-            return
-        }
-
-        guard !ttsModels.isEmpty else { return }
-
-        selectedTTSModel = nil
-        persistSpecializedModelIdentifier("", for: .ttsModelIdentifier)
-        ttsModelIdentifier = ""
-        ttsManager.updateSelectedModel(nil)
     }
 
     func syncEmbeddingModelSelection() {

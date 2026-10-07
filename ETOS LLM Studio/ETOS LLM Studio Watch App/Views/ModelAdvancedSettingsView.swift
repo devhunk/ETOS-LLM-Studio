@@ -59,6 +59,7 @@ struct ModelAdvancedSettingsView: View {
     @Binding var periodicTimeLandmarkIntervalMinutes: Int
 
     let addGlobalSystemPromptEntry: () -> Void
+    let duplicateGlobalSystemPromptEntry: (UUID) async -> GlobalSystemPromptEntry?
     let selectGlobalSystemPromptEntry: (UUID?) -> Void
     let updateSelectedGlobalSystemPromptContent: (String) -> Void
     let updateGlobalSystemPromptEntry: (UUID, String, String) -> Void
@@ -122,13 +123,17 @@ struct ModelAdvancedSettingsView: View {
             }
 
             if destination == .prompts {
+                PromptMacroHelpSection {
+                    PromptMacroHelpView().watchGuideEntry()
+                }
+
                 Section {
                     Toggle(
                         NSLocalizedString("在模型选择器中显示提示词", comment: "Show prompt shortcut in model picker"),
                         isOn: $appConfig.modelPickerPromptShortcutEnabled
                     )
                 } footer: {
-                    Text(NSLocalizedString("开启后，可从模型选择器快速编辑系统、话题与增强提示词。", comment: "Prompt shortcut setting description"))
+                    Text(NSLocalizedString("开启后，可从模型选择器快速编辑系统、话题与增强提示词。", value: "When enabled, you can switch saved global prompts and edit system, topic, and enhanced prompts from the model picker.", comment: "模型选择器提示词快捷入口说明"))
                 }
 
                 Section(header: Text(NSLocalizedString("全局系统提示词", comment: ""))) {
@@ -141,18 +146,16 @@ struct ModelAdvancedSettingsView: View {
                         entries: globalSystemPromptEntries,
                         selectedEntryID: selectedGlobalSystemPromptEntryID,
                         addGlobalSystemPromptEntry: addGlobalSystemPromptEntry,
+                        duplicateGlobalSystemPromptEntry: duplicateGlobalSystemPromptEntry,
                         selectGlobalSystemPromptEntry: selectGlobalSystemPromptEntry,
                         updateGlobalSystemPromptEntry: updateGlobalSystemPromptEntry,
                         deleteGlobalSystemPromptEntry: deleteGlobalSystemPromptEntry
                     )
                 } label: {
-                    HStack {
-                        Text(NSLocalizedString("提示词列表", comment: ""))
-                        Spacer()
-                        Text(displayTitle(for: selectedGlobalPromptEntry))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
+                    MarqueeTitleSubtitleLabel(
+                        title: NSLocalizedString("提示词列表", comment: ""),
+                        subtitle: displayTitle(for: selectedGlobalPromptEntry)
+                    )
                 }
             }
 
@@ -197,7 +200,7 @@ struct ModelAdvancedSettingsView: View {
                 .foregroundStyle(.secondary)
             }
 
-                Section(header: Text(NSLocalizedString("动态时间注入", comment: ""))) {
+                Section {
                     Toggle(NSLocalizedString("发送系统时间", comment: ""), isOn: $includeSystemTimeInPrompt)
                     if includeSystemTimeInPrompt {
                         Picker(NSLocalizedString("发送位置", comment: ""), selection: $systemTimeInjectionPosition) {
@@ -213,6 +216,16 @@ struct ModelAdvancedSettingsView: View {
                         formatter: numberFormatter
                     )
                     .disabled(!enablePeriodicTimeLandmark)
+                } header: {
+                    Text(NSLocalizedString("动态时间注入", comment: ""))
+                } footer: {
+                    Text(NSLocalizedString(
+                        "提示词宏时间注入说明",
+                        value: "System time can be added at the beginning or end, or inserted anywhere using prompt macros. Changing time may reduce cache reuse from that position onward.",
+                        comment: "时间注入位置选择与缓存效果"
+                    ))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 }
 
                 Section(header: Text(NSLocalizedString("内置提示词", comment: "Built-in prompt settings section"))) {
@@ -260,7 +273,7 @@ struct ModelAdvancedSettingsView: View {
 
                 Section(
                     header: Text(NSLocalizedString("上下文窗口管理", comment: "")),
-                    footer: Text(NSLocalizedString("开启后会在接近边缘时自动加载并回收历史气泡。关闭后按设置显示最近消息，每次向上加载 5 条；回到底部时恢复初始范围。设为 0 时显示全部历史。", comment: "自动管理聊天历史窗口说明"))
+                    footer: Text(NSLocalizedString("自动加载历史消息；关闭后按指定数量显示。", comment: "历史消息简短提示"))
                 ) {
                     HStack {
                         Text(NSLocalizedString("最大上下文消息数", comment: ""))
@@ -411,6 +424,8 @@ struct ModelAdvancedSettingsView: View {
                     Toggle(NSLocalizedString("流式附带官方 Token 用量", comment: "Enable stream include usage in OpenAI-compatible requests"), isOn: $enableOpenAIStreamIncludeUsage)
                 }
 
+                ChatRequestRetrySettingsSection()
+
                 Section(
                     header: Text(NSLocalizedString("思考与推理", comment: "Output reasoning settings section")),
                     footer: reasoningContentEchoFooter
@@ -467,6 +482,101 @@ struct ModelAdvancedSettingsView: View {
             }
         }
         .onDisappear(perform: commitContextCompressionReminderThresholdDraft)
+        .guideSettingsPageContext(
+            id: guidePageID,
+            title: destination.title,
+            documents: [GuideDocumentReference(id: "settings-core", title: "Core Settings")],
+            settings: guideSettings
+        )
+        .watchGuideEntry()
+    }
+
+    private var guidePageID: GuidePageID {
+        switch destination {
+        case .conversation: return "settings-conversation"
+        case .prompts: return "settings-prompts"
+        case .output: return "settings-output"
+        }
+    }
+
+    private var guideSettings: [GuidePageSetting] {
+        switch destination {
+        case .conversation: return conversationGuideSettings
+        case .prompts: return promptGuideSettings
+        case .output: return outputGuideSettings
+        }
+    }
+
+    private var conversationGuideSettings: [GuidePageSetting] {
+        var settings: [GuidePageSetting] = [
+            .bool("auto_session_naming", label: NSLocalizedString("自动生成话题标题", comment: "向导设置字段"), get: { enableAutoSessionNaming }, set: { enableAutoSessionNaming = $0 }),
+            .double("send_delay_seconds", label: NSLocalizedString("延迟发送秒数", comment: "向导设置字段"), range: 0...3_600, get: { normalizedSendDelay(appConfig.chatSendDelaySeconds) }, set: { appConfig.chatSendDelaySeconds = normalizedSendDelay($0) }),
+            .integer("automatic_execution_budget", label: NSLocalizedString("自动执行预算", comment: "向导设置字段"), range: 1...10_000, get: { max(1, appConfig.conversationRuntimeExecutionBudget) }, set: { appConfig.conversationRuntimeExecutionBudget = max(1, $0) }),
+            .integer("max_context_messages", label: NSLocalizedString("最大上下文消息数", comment: "向导设置字段"), range: 1...100_000, get: { maxChatHistory }, set: { maxChatHistory = $0 }),
+            .bool("automatic_history_loading", label: NSLocalizedString("自动管理历史消息", comment: "向导设置字段"), get: { viewModel.automaticHistoryLoadingEnabled }, set: { viewModel.automaticHistoryLoadingEnabled = $0 }),
+            .bool("context_compression_reminder", label: NSLocalizedString("上下文压缩提醒", comment: "向导设置字段"), get: { appConfig.enableContextCompressionReminder }, set: { appConfig.enableContextCompressionReminder = $0 }),
+            .integer("context_compression_token_threshold", label: NSLocalizedString("上下文压缩提醒阈值", comment: "向导设置字段"), range: 1...10_000_000, get: { appConfig.contextCompressionReminderTokenThreshold }, set: { appConfig.contextCompressionReminderTokenThreshold = $0 }),
+            .bool("use_video_analysis_model", label: NSLocalizedString("非原生视频使用解析模型", comment: "向导设置字段"), get: { appConfig.enableVideoAnalysisForNonNativeModels }, set: { appConfig.enableVideoAnalysisForNonNativeModels = $0 }),
+            .string("video_analysis_model", label: NSLocalizedString("视频解析模型", comment: "向导设置字段"), allowedValues: viewModel.videoAnalysisModelOptions.map(\.id), get: { appConfig.videoAnalysisModelIdentifier }, set: { setVideoAnalysisModelIdentifier($0) }),
+            .string("video_frame_mode", label: NSLocalizedString("视频处理方式", comment: "向导设置字段"), allowedValues: VideoFrameExtractionMode.allCases.map(\.rawValue), get: { VideoFrameExtractionMode.normalized(appConfig.videoFrameExtractionMode).rawValue }, set: { appConfig.videoFrameExtractionMode = $0 }),
+            .double("video_frame_fps", label: NSLocalizedString("视频抽帧速率", comment: "向导设置字段"), range: 0.1...5, get: { videoFrameExtractionFPSBinding.wrappedValue }, set: { videoFrameExtractionFPSBinding.wrappedValue = $0 }),
+            .integer("video_frame_maximum_count", label: NSLocalizedString("最多画面数", comment: "向导设置字段"), range: 4...120, get: { videoFrameMaximumCountBinding.wrappedValue }, set: { videoFrameMaximumCountBinding.wrappedValue = $0 })
+        ]
+        if !viewModel.automaticHistoryLoadingEnabled {
+            settings.append(.integer("initial_visible_messages", label: NSLocalizedString("初始显示消息数", comment: "向导设置字段"), range: 1...100_000, get: { lazyLoadMessageCount }, set: { lazyLoadMessageCount = $0 }))
+        }
+        return settings
+    }
+
+    private var promptGuideSettings: [GuidePageSetting] {
+        var settings: [GuidePageSetting] = [
+            .bool("model_picker_prompt_shortcut", label: NSLocalizedString("在模型选择器中显示提示词", comment: "向导设置字段"), get: { appConfig.modelPickerPromptShortcutEnabled }, set: { appConfig.modelPickerPromptShortcutEnabled = $0 }),
+            .readOnly("global_prompt_count", label: NSLocalizedString("全局提示词数量", comment: "向导设置字段"), value: { .int(globalSystemPromptEntries.count) }),
+            .readOnly("selected_global_prompt_id", label: NSLocalizedString("当前全局提示词 ID", comment: "向导设置字段"), value: { .string(selectedGlobalSystemPromptEntryID?.uuidString ?? "") }),
+            .bool("enhanced_prompt_uses_system_role", label: NSLocalizedString("增强提示词使用 System 角色", comment: "向导设置字段"), get: { appConfig.openAITailContextUsesSystemRole }, set: { appConfig.openAITailContextUsesSystemRole = $0 }),
+            .bool("include_system_time", label: NSLocalizedString("发送系统时间", comment: "向导设置字段"), get: { includeSystemTimeInPrompt }, set: { includeSystemTimeInPrompt = $0 }),
+            .string("system_time_position", label: NSLocalizedString("系统时间发送位置", comment: "向导设置字段"), allowedValues: SystemTimeInjectionPosition.allCases.map(\.rawValue), get: { systemTimeInjectionPosition.rawValue }, set: { if let value = SystemTimeInjectionPosition(rawValue: $0) { systemTimeInjectionPosition = value } }),
+            .bool("periodic_time_landmark", label: NSLocalizedString("周期性时间路标", comment: "向导设置字段"), get: { enablePeriodicTimeLandmark }, set: { enablePeriodicTimeLandmark = $0 }),
+            .integer("time_landmark_interval_minutes", label: NSLocalizedString("路标间隔分钟", comment: "向导设置字段"), range: 1...525_600, get: { periodicTimeLandmarkIntervalMinutes }, set: { periodicTimeLandmarkIntervalMinutes = $0 })
+        ]
+        if selectedGlobalPromptEntry != nil {
+            settings.append(.string("selected_global_prompt_content", label: NSLocalizedString("当前全局系统提示词", comment: "向导设置字段"), get: { selectedGlobalPromptEntry?.content ?? "" }, set: { updateSelectedGlobalSystemPromptContent($0) }))
+        }
+        if currentSession != nil {
+            settings.append(.string("current_topic_prompt", label: NSLocalizedString("当前话题提示词", comment: "向导设置字段"), get: { currentSession?.topicPrompt ?? "" }, set: { setTopicPromptFromGuide($0) }))
+            settings.append(.string("current_enhanced_prompt", label: NSLocalizedString("当前增强提示词", comment: "向导设置字段"), get: { currentSession?.enhancedPrompt ?? "" }, set: { setEnhancedPromptFromGuide($0) }))
+        }
+        return settings
+    }
+
+    private var outputGuideSettings: [GuidePageSetting] {
+        [
+            .bool("temperature_enabled", label: NSLocalizedString("自定义 Temperature", comment: "向导设置字段"), get: { aiTemperatureEnabled }, set: { aiTemperatureEnabled = $0 }),
+            .double("temperature", label: NSLocalizedString("Temperature", comment: "向导设置字段"), range: temperatureRange, get: { temperatureBinding.wrappedValue }, set: { temperatureBinding.wrappedValue = $0 }),
+            .bool("top_p_enabled", label: NSLocalizedString("自定义 Top P", comment: "向导设置字段"), get: { aiTopPEnabled }, set: { aiTopPEnabled = $0 }),
+            .double("top_p", label: NSLocalizedString("Top P", comment: "向导设置字段"), range: topPRange, get: { topPBinding.wrappedValue }, set: { topPBinding.wrappedValue = $0 }),
+            .bool("streaming_enabled", label: NSLocalizedString("启用流式输出", comment: "向导设置字段"), get: { enableStreaming }, set: { enableStreaming = $0 }),
+            .integer("maximum_request_retries", label: NSLocalizedString("最大重试次数", comment: ""), range: ChatRequestRetryPolicy.allowedMaximumRetries, get: { appConfig.maximumRequestRetries }, set: { appConfig.maximumRequestRetries = $0 }),
+            .bool("request_retry_smart_detection", label: NSLocalizedString("智能判断", comment: "自动重试错误筛选开关"), get: { appConfig.requestRetrySmartDetectionEnabled }, set: { appConfig.requestRetrySmartDetectionEnabled = $0 }),
+            .bool("stream_include_usage", label: NSLocalizedString("流式附带官方 Token 用量", comment: "向导设置字段"), get: { enableOpenAIStreamIncludeUsage }, set: { enableOpenAIStreamIncludeUsage = $0 }),
+            .bool("reasoning_summary", label: NSLocalizedString("启用思考摘要", comment: "向导设置字段"), get: { enableReasoningSummary }, set: { enableReasoningSummary = $0 }),
+            .string("reasoning_content_echo_mode", label: NSLocalizedString("思维链回传", comment: "向导设置字段"), allowedValues: ReasoningContentEchoMode.allCases.map(\.rawValue), get: { ReasoningContentEchoMode.normalized(appConfig.reasoningContentEchoMode).rawValue }, set: { appConfig.reasoningContentEchoMode = $0 }),
+            .bool("response_speed_metrics", label: NSLocalizedString("启用响应测速", comment: "向导设置字段"), get: { enableResponseSpeedMetrics }, set: { enableResponseSpeedMetrics = $0 })
+        ]
+    }
+
+    private func setTopicPromptFromGuide(_ value: String) {
+        guard var session = currentSession else { return }
+        session.topicPrompt = value
+        currentSession = session
+        ChatService.shared.updateSession(session)
+    }
+
+    private func setEnhancedPromptFromGuide(_ value: String) {
+        guard var session = currentSession else { return }
+        session.enhancedPrompt = value
+        currentSession = session
+        ChatService.shared.updateSession(session)
     }
 
     private var conversationRuntimeBudgetBinding: Binding<Int> {
@@ -578,26 +688,11 @@ struct ModelAdvancedSettingsView: View {
     private var settingsIntroSummary: String {
         switch destination {
         case .conversation:
-            return [
-                NSLocalizedString("启动与发送", comment: "Conversation launch and send settings section"),
-                NSLocalizedString("上下文窗口管理", comment: ""),
-                NSLocalizedString("消息规则", comment: ""),
-                NSLocalizedString("视频发送", comment: "Video sending settings section")
-            ].joined(separator: " · ")
+            return NSLocalizedString("会话设置简介", comment: "说明会话、发送和历史消息设置的用途")
         case .prompts:
-            return [
-                NSLocalizedString("全局系统提示词", comment: ""),
-                NSLocalizedString("增强提示词", comment: ""),
-                NSLocalizedString("内置提示词", comment: "Built-in prompt settings section"),
-                NSLocalizedString("动态时间注入", comment: "")
-            ].joined(separator: " · ")
+            return NSLocalizedString("提示词设置简介", comment: "说明提示词能改变的回答习惯")
         case .output:
-            return [
-                NSLocalizedString("采样参数", comment: ""),
-                NSLocalizedString("流式输出", comment: ""),
-                NSLocalizedString("思考与推理", comment: "Output reasoning settings section"),
-                NSLocalizedString("语音朗读", comment: "TTS output settings section")
-            ].joined(separator: " · ")
+            return NSLocalizedString("回复设置简介", comment: "说明回复风格、流式显示与朗读的用途")
         }
     }
 
@@ -629,22 +724,17 @@ struct ModelAdvancedSettingsView: View {
                 )
             ])
         case .prompts:
-            return introDetails([
-                (
-                    NSLocalizedString("提示词", comment: "Core prompt settings title"),
-                    [
-                        NSLocalizedString("在二级菜单中可右滑删除、左滑更多（编辑），点选条目会自动返回。", comment: ""),
-                        NSLocalizedString("该提示词会附加在您的最后一条消息末尾，以增强指令效果。", comment: ""),
-                        NSLocalizedString("警告：直接在前置系统提示词中插入 <time> 可能会降低上下文缓存命中率。若可行，优先使用末尾发送，或改用获取系统时间工具。", comment: "")
-                    ].joined(separator: "\n\n")
-                ),
-                (
-                    NSLocalizedString("内置提示词", comment: "Built-in prompt settings section"),
-                    NSLocalizedString("未自定义时会跟随应用语言使用内置模板；自定义后会固定使用保存内容。", comment: "Built-in prompt settings footer")
-                )
-            ])
+            return NSLocalizedString("提示词设置使用说明", comment: "用例、作用范围与时间提示的使用方法")
         case .output:
             return introDetails([
+                (
+                    NSLocalizedString("输出", comment: "回复设置使用说明标题"),
+                    NSLocalizedString("回复设置使用说明", comment: "采样、流式输出与朗读的使用方法")
+                ),
+                (
+                    NSLocalizedString("自动重试", comment: ""),
+                    NSLocalizedString("自动重试使用说明", comment: "")
+                ),
                 (
                     NSLocalizedString("思考与推理", comment: "Output reasoning settings section"),
                     reasoningContentEchoDetails
@@ -792,16 +882,19 @@ struct ModelAdvancedSettingsView: View {
     }
 }
 
-private struct GlobalSystemPromptPickerView: View {
+// 设置页与模型选择器共用同一列表，保持切换、编辑和创建副本的行为一致。
+struct GlobalSystemPromptPickerView: View {
     let entries: [GlobalSystemPromptEntry]
     let selectedEntryID: UUID?
     let addGlobalSystemPromptEntry: () -> Void
+    let duplicateGlobalSystemPromptEntry: (UUID) async -> GlobalSystemPromptEntry?
     let selectGlobalSystemPromptEntry: (UUID?) -> Void
     let updateGlobalSystemPromptEntry: (UUID, String, String) -> Void
     let deleteGlobalSystemPromptEntry: (UUID) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var editingEntry: GlobalSystemPromptEntry?
+    @State private var duplicatingEntryID: UUID?
 
     var body: some View {
         List {
@@ -813,30 +906,15 @@ private struct GlobalSystemPromptPickerView: View {
                 }
             }
 
-            Section(NSLocalizedString("全局系统提示词", comment: "")) {
+            Section {
                 ForEach(entries) { entry in
                     Button {
                         selectGlobalSystemPromptEntry(entry.id)
                         dismiss()
                     } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(displayTitle(for: entry))
-                                    .lineLimit(1)
-                                Text(displayPreview(for: entry))
-                                    .etFont(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-
-                            Spacer()
-
-                            if selectedEntryID == entry.id {
-                                Image(systemName: "checkmark")
-                                    .foregroundStyle(.blue)
-                            }
-                        }
+                        GlobalSystemPromptSelectionLabel(entry: entry, isSelected: selectedEntryID == entry.id)
                     }
+                    .buttonStyle(.plain)
                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                         Button(role: .destructive) {
                             deleteGlobalSystemPromptEntry(entry.id)
@@ -851,11 +929,38 @@ private struct GlobalSystemPromptPickerView: View {
                             Label(NSLocalizedString("更多", comment: ""), systemImage: "ellipsis.circle")
                         }
                         .tint(.blue)
+                        Button {
+                            duplicatingEntryID = entry.id
+                        } label: {
+                            Label(NSLocalizedString("global_prompt.duplicate", value: "Duplicate", comment: "创建全局提示词副本"), systemImage: "doc.on.doc")
+                        }
+                        .tint(.orange)
                     }
                 }
+            } header: {
+                Text(NSLocalizedString("全局系统提示词", comment: ""))
+            } footer: {
+                Text(NSLocalizedString("global_prompt.swipe_hint", value: "Swipe a prompt to edit it or create a copy.", comment: "全局提示词列表滑动操作提示"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .navigationTitle(NSLocalizedString("全局提示词", comment: ""))
+        .disabled(duplicatingEntryID != nil)
+        .task(id: duplicatingEntryID) {
+            guard let id = duplicatingEntryID else { return }
+            let copy = await duplicateGlobalSystemPromptEntry(id)
+            guard !Task.isCancelled else { return }
+            duplicatingEntryID = nil
+            editingEntry = copy
+        }
+        .guideSettingsPageContext(
+            id: "settings-global-system-prompts",
+            title: NSLocalizedString("全局提示词", comment: "全局提示词列表向导上下文标题"),
+            documents: [GuideDocumentReference(id: "settings-core", title: "Core Settings")],
+            settings: guideSettings
+        )
+        .watchGuideEntry()
         .sheet(item: $editingEntry) { entry in
             GlobalSystemPromptEditorView(entry: entry) { title, content in
                 updateGlobalSystemPromptEntry(entry.id, title, content)
@@ -863,18 +968,46 @@ private struct GlobalSystemPromptPickerView: View {
         }
     }
 
-    private func displayTitle(for entry: GlobalSystemPromptEntry) -> String {
-        let trimmedTitle = entry.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedTitle.isEmpty ? NSLocalizedString("未命名提示词", comment: "") : trimmedTitle
+    private var guideSettings: [GuidePageSetting] {
+        var settings: [GuidePageSetting] = [
+            .readOnly(
+                "duplicate_requires_native_action",
+                label: NSLocalizedString("global_prompt.duplicate", value: "Duplicate", comment: "创建全局提示词副本"),
+                value: { .bool(true) }
+            ),
+            .readOnly(
+                "entries",
+                label: NSLocalizedString("全局系统提示词列表", comment: "全局提示词向导字段"),
+                value: {
+                    .array(entries.map { entry in
+                        .dictionary([
+                            "id": .string(entry.id.uuidString),
+                            "title": .string(entry.title),
+                            "content": .string(entry.content)
+                        ])
+                    })
+                }
+            )
+        ]
+        let entryIDs = entries.map { $0.id.uuidString }
+        if !entryIDs.isEmpty, duplicatingEntryID == nil {
+            settings.append(
+                .string(
+                    "selected_entry_id",
+                    label: NSLocalizedString("当前提示词", comment: "全局提示词向导字段"),
+                    allowedValues: entryIDs,
+                    allowsEmpty: false,
+                    get: { selectedEntryID?.uuidString ?? entryIDs[0] },
+                    set: { value in
+                        guard let id = UUID(uuidString: value) else { return }
+                        selectGlobalSystemPromptEntry(id)
+                    }
+                )
+            )
+        }
+        return settings
     }
 
-    private func displayPreview(for entry: GlobalSystemPromptEntry) -> String {
-        let trimmedContent = entry.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedContent.isEmpty {
-            return NSLocalizedString("空提示词（不发送）", comment: "")
-        }
-        return trimmedContent.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-    }
 }
 
 private struct GlobalSystemPromptEditorView: View {
@@ -895,6 +1028,10 @@ private struct GlobalSystemPromptEditorView: View {
     var body: some View {
         NavigationStack {
             List {
+                PromptMacroHelpSection {
+                    PromptMacroHelpView().watchGuideEntry()
+                }
+
                 TextField(NSLocalizedString("提示词名称", comment: ""), text: $title.watchKeyboardNewlineBinding())
                 TextField(NSLocalizedString("提示词内容", comment: ""), text: $content.watchKeyboardNewlineBinding(), axis: .vertical)
                     .lineLimit(4...10)
@@ -906,6 +1043,21 @@ private struct GlobalSystemPromptEditorView: View {
                 .buttonStyle(.borderedProminent)
             }
             .navigationTitle(NSLocalizedString("编辑提示词", comment: ""))
+            .watchGuideEntry()
         }
+        .guideSettingsPageContext(
+            id: GuidePageID(rawValue: "settings-global-system-prompt-editor-\(entry.id.uuidString)"),
+            title: NSLocalizedString("编辑提示词", comment: "全局提示词编辑向导上下文标题"),
+            documents: [GuideDocumentReference(id: "settings-core", title: "Core Settings")],
+            settings: [
+                .string("title", label: NSLocalizedString("提示词名称", comment: "全局提示词向导字段"), get: { title }, set: { title = $0 }),
+                .string("content", label: NSLocalizedString("提示词内容", comment: "全局提示词向导字段"), get: { content }, set: { content = $0 }),
+                .readOnly(
+                    "save_required",
+                    label: NSLocalizedString("修改后需要保存", comment: "向导保存说明"),
+                    value: { .bool(true) }
+                )
+            ]
+        )
     }
 }

@@ -60,6 +60,7 @@ extension Model {
         requestBodyOverrideMode == other.requestBodyOverrideMode &&
         rawRequestBodyJSON == other.rawRequestBodyJSON &&
         requestBodyControls == other.requestBodyControls &&
+        prompt == other.prompt &&
         pricing?.normalized == other.pricing?.normalized
     }
 }
@@ -71,7 +72,9 @@ extension ChatSession {
         topicPrompt == other.topicPrompt &&
         enhancedPrompt == other.enhancedPrompt &&
         folderID == other.folderID &&
-        worldbookContextIsolationEnabled == other.worldbookContextIsolationEnabled &&
+        memoryContextIsolationEnabled == other.memoryContextIsolationEnabled &&
+        toolContextIsolationEnabled == other.toolContextIsolationEnabled &&
+        globalSystemPromptIsolationEnabled == other.globalSystemPromptIsolationEnabled &&
         Set(lorebookIDs) == Set(other.lorebookIDs) &&
         Set(tagIDs) == Set(other.tagIDs)
     }
@@ -88,7 +91,9 @@ extension ChatSession {
         topicPrompt == other.topicPrompt &&
         enhancedPrompt == other.enhancedPrompt &&
         folderID == other.folderID &&
-        worldbookContextIsolationEnabled == other.worldbookContextIsolationEnabled &&
+        memoryContextIsolationEnabled == other.memoryContextIsolationEnabled &&
+        toolContextIsolationEnabled == other.toolContextIsolationEnabled &&
+        globalSystemPromptIsolationEnabled == other.globalSystemPromptIsolationEnabled &&
         Set(lorebookIDs) == Set(other.lorebookIDs) &&
         Set(tagIDs) == Set(other.tagIDs)
     }

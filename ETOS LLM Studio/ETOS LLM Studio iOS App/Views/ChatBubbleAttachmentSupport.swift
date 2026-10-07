@@ -32,14 +32,25 @@ extension ChatBubble {
                         minWidth: minWidth,
                         maxWidth: maxWidth,
                         height: itemHeight,
-                        cornerRadius: 16
+                        cornerRadius: 16,
+                        onOpenMessageActions: isSelectionMode ? nil : openMoreAction
                     ) { image in
-                        imagePreview = ImagePreviewPayload(image: image)
+                        imagePreview = ImagePreviewPayload(image: image, fileName: fileName)
                     } onDownload: {
                         onDownloadImageAttachment?(fileName)
                     } onDelete: {
                         onDeleteImageAttachment?(fileName)
                     }
+                    .modifier(ChatAttachmentImageSourceModifier(
+                        sourceID: fileName,
+                        namespace: imagePreviewNamespace,
+                        cornerRadius: 16
+                    ))
+                    .modifier(ChatSendFlightContentModifier(
+                        layoutIdentity: bubbleContentLayoutIdentity,
+                        opacity: sendFlightContentOpacity,
+                        target: sendFlightTarget
+                    ))
                 }
             }
             .frame(maxWidth: attachmentMaxWidth, alignment: isOutgoing ? .trailing : .leading)
@@ -76,8 +87,11 @@ extension ChatBubble {
                         .padding(.vertical, 8)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(fileAttachmentBackgroundColor)
+                            ChatBubbleBackground(
+                                shape: RoundedRectangle(cornerRadius: 12),
+                                fill: AnyShapeStyle(fileAttachmentBackgroundColor),
+                                enableLiquidGlass: false
+                            )
                         )
                     } else {
                         Button {
@@ -100,8 +114,11 @@ extension ChatBubble {
                             .padding(.vertical, 8)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .fill(fileAttachmentBackgroundColor)
+                                ChatBubbleBackground(
+                                    shape: RoundedRectangle(cornerRadius: 12),
+                                    fill: AnyShapeStyle(fileAttachmentBackgroundColor),
+                                    enableLiquidGlass: false
+                                )
                             )
                         }
                         .buttonStyle(.plain)
@@ -110,6 +127,11 @@ extension ChatBubble {
                 }
             }
             .frame(maxWidth: attachmentMaxWidth, alignment: isOutgoing ? .trailing : .leading)
+            .modifier(ChatSendFlightContentModifier(
+                layoutIdentity: bubbleContentLayoutIdentity,
+                opacity: sendFlightContentOpacity,
+                target: sendFlightTarget
+            ))
 
             if !isOutgoing {
                 Spacer(minLength: 0)
@@ -154,7 +176,21 @@ extension ChatBubble {
     @ViewBuilder
     func renderContent(_ content: String) -> some View {
         let shouldRenderAsOutgoing = isOutgoing || isError
-        if let extraction = messageState.roleplayHTML,
+        if messageState.isUserContentTruncated {
+            VStack(alignment: .leading) {
+                Text(content)
+                if let onOpenFullContent, !isSelectionMode {
+                    Button {
+                        // 预览只用于气泡，全文页始终读取未截断的原始消息。
+                        onOpenFullContent(messageState.message)
+                    } label: {
+                        Text(NSLocalizedString("查看完整内容", comment: ""))
+                            .etFont(.caption)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        } else if let extraction = messageState.roleplayHTML,
            let roleplaySessionID,
            extraction.containsHTML {
             VStack(alignment: .leading) {

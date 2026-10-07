@@ -12,17 +12,27 @@ public final class TTSManager: NSObject, ObservableObject {
     @Published public internal(set) var isSpeaking: Bool = false
     @Published public internal(set) var playbackState: TTSPlaybackState = .init()
     @Published public internal(set) var currentSpeakingMessageID: UUID?
+    @Published var cachedNetworkAudioExport: TTSAudioExport?
 
     let logger = Logger(subsystem: "com.ETOS.LLM.Studio", category: "TTSManager")
     let settingsStore = TTSSettingsStore.shared
     let urlSession: URLSession
 
-    var selectedModel: RunnableModel?
     var queue: [QueueItem] = []
     var workerTask: Task<Void, Never>?
     var workerGeneration = 0
+    var preparationTask: Task<Void, Never>?
+    var preparationGeneration = 0
     var prefetchTasks: [UUID: Task<AudioClip, Error>] = [:]
     let prefetchWindowSize: Int = 1
+    var activeNetworkItemIDs: [UUID] = []
+    var activeNetworkItemTexts: [UUID: String] = [:]
+    var activeNetworkClips: [UUID: AudioClip] = [:]
+    var lastNetworkChunkTexts: [String] = []
+    var lastNetworkAudioClips: [AudioClip] = []
+    var pendingReplayChunkTexts: [String] = []
+    var pendingReplayAudioClips: [AudioClip] = []
+    var audioExportRevision = 0
     var isPausedByUser = false
     var activeBackend: ActiveBackend = .none
     private var isApplicationInBackground = false
@@ -51,12 +61,16 @@ public final class TTSManager: NSObject, ObservableObject {
         let messageID: UUID?
         let text: String
         let playbackModeOverride: TTSPlaybackMode?
+        let serviceOverride: TTSServiceConfiguration?
+        let cachedClip: AudioClip?
     }
 
     /// 用于在朗读结束后执行“重试朗读”
     struct ReplayRequest {
         let messageID: UUID?
         let text: String
+        let playbackModeOverride: TTSPlaybackMode?
+        let serviceOverride: TTSServiceConfiguration?
     }
 
     enum ActiveBackend {
@@ -69,6 +83,7 @@ public final class TTSManager: NSObject, ObservableObject {
         var data: Data
         var format: String
         var sampleRate: Int?
+        var channels: Int = 1
     }
 
     var lastReplayRequest: ReplayRequest?
@@ -78,15 +93,12 @@ public final class TTSManager: NSObject, ObservableObject {
         super.init()
     }
 
-    public func updateSelectedModel(_ model: RunnableModel?) {
-        selectedModel = model
-    }
-
     public func speak(
         _ text: String,
         messageID: UUID? = nil,
         flush: Bool = true,
-        playbackModeOverride: TTSPlaybackMode? = nil
+        playbackModeOverride: TTSPlaybackMode? = nil,
+        serviceOverride: TTSServiceConfiguration? = nil
     ) {
         guard TTSBackgroundPlaybackPolicy.allowsPlayback(
             isApplicationInBackground: isApplicationInBackground,
@@ -96,31 +108,32 @@ public final class TTSManager: NSObject, ObservableObject {
             return
         }
 
-        logger.info("TTS 收到朗读请求：原始长度=\(text.count, privacy: .public)")
-#if DEBUG
-        print("[TTS] 收到朗读请求，原始长度=\(text.count)")
-#endif
-
         let settings = settingsStore.snapshot
-        let boundedText = boundedSpeechInput(text, settings: settings)
-        if boundedText.count < text.count {
-            logger.info("TTS 文本已截断：截断后长度=\(boundedText.count, privacy: .public)")
-#if DEBUG
-            print("[TTS] 文本已截断，截断后长度=\(boundedText.count)")
+        let selectionMode = TTSTextSelectionMode(rawValue: AppConfigStore.shared.ttsTextSelectionMode)
+            ?? (settings.onlyReadQuotedContent ? .quotedOnly : .fullText)
+        let filterCodeAndHTML = AppConfigStore.shared.ttsFilterCodeAndHTML
+#if os(watchOS)
+        let maxCharacters = min(max(settings.watchSpeechMaxCharacters, 500), 6_000)
+        let lightweight = settings.watchUseLightweightPreprocess
+#else
+        let maxCharacters = 12_000
+        let lightweight = false
 #endif
-        }
-
-        let processed = preprocessText(boundedText, settings: settings)
-        guard !processed.isEmpty else { return }
-
-        let chunks = splitText(processed)
-        guard !chunks.isEmpty else { return }
-
-        logger.info("TTS 入队：分段数=\(chunks.count, privacy: .public)，播放模式=\(settings.playbackMode.rawValue, privacy: .public)")
-
-        lastReplayRequest = ReplayRequest(messageID: messageID, text: text)
+        let replayAudioClips = pendingReplayAudioClips
+        let replayChunkTexts = pendingReplayChunkTexts
+        pendingReplayAudioClips = []
+        pendingReplayChunkTexts = []
+        let request = ReplayRequest(
+            messageID: messageID,
+            text: text,
+            playbackModeOverride: playbackModeOverride,
+            serviceOverride: serviceOverride
+        )
 
         if flush {
+            preparationGeneration &+= 1
+            preparationTask?.cancel()
+            preparationTask = nil
             workerGeneration &+= 1
             workerTask?.cancel()
             workerTask = nil
@@ -132,16 +145,81 @@ public final class TTSManager: NSObject, ObservableObject {
             playbackState.position = 0
             playbackState.duration = 0
             playbackState.status = .idle
+            audioExportRevision &+= 1
+            cachedNetworkAudioExport = nil
+            lastNetworkChunkTexts = []
+            lastNetworkAudioClips = []
+            activeNetworkItemTexts = [:]
+            activeNetworkClips = [:]
+            activeNetworkItemIDs = []
         }
 
-        let newItems = chunks.map {
+        if workerTask == nil {
+            isSpeaking = true
+            currentSpeakingMessageID = messageID
+            playbackState.status = .buffering
+            playbackState.errorMessage = nil
+        }
+        let generation = preparationGeneration
+        let previousPreparation = preparationTask
+        preparationTask = Task { [weak self] in
+            // 追加朗读保持请求顺序；停止或替换后，旧预处理结果不得重新启动播放。
+            await previousPreparation?.value
+            guard !Task.isCancelled else { return }
+            let preparation = Task.detached(priority: .userInitiated) {
+                guard !Task.isCancelled else { return [String]() }
+                let processed = Self.preprocessText(
+                    text, mode: selectionMode, filterCodeAndHTML: filterCodeAndHTML,
+                    lightweight: lightweight, maxCharacters: maxCharacters
+                )
+                guard !Task.isCancelled else { return [String]() }
+                return Self.splitTextForPlayback(processed)
+            }
+            let chunks = await withTaskCancellationHandler {
+                await preparation.value
+            } onCancel: {
+                preparation.cancel()
+            }
+            guard !Task.isCancelled, let self, generation == self.preparationGeneration else { return }
+            guard !chunks.isEmpty else {
+                if self.workerTask == nil {
+                    self.deactivateTTSAudioSessionIfNeeded()
+                    self.isSpeaking = false
+                    self.currentSpeakingMessageID = nil
+                    self.playbackState.status = .idle
+                }
+                return
+            }
+            self.enqueuePreparedSpeech(
+                chunks, request: request,
+                replayChunkTexts: replayChunkTexts, replayAudioClips: replayAudioClips
+            )
+        }
+    }
+
+    private func enqueuePreparedSpeech(
+        _ chunks: [String],
+        request: ReplayRequest,
+        replayChunkTexts: [String],
+        replayAudioClips: [AudioClip]
+    ) {
+        logger.info("TTS 入队：分段数=\(chunks.count, privacy: .public)")
+        lastReplayRequest = request
+        let canReuseNetworkAudio = chunks == replayChunkTexts && chunks.count == replayAudioClips.count
+        let newItems = chunks.enumerated().map { index, chunk in
             QueueItem(
-                messageID: messageID,
-                text: $0,
-                playbackModeOverride: playbackModeOverride
+                messageID: request.messageID,
+                text: chunk,
+                playbackModeOverride: request.playbackModeOverride,
+                serviceOverride: request.serviceOverride,
+                cachedClip: canReuseNetworkAudio ? replayAudioClips[index] : nil
             )
         }
         queue.append(contentsOf: newItems)
+        activeNetworkItemIDs.append(contentsOf: newItems.map(\.id))
+        for item in newItems {
+            activeNetworkItemTexts[item.id] = item.text
+        }
 
         if workerTask == nil || workerTask?.isCancelled == true {
             workerGeneration &+= 1
@@ -160,7 +238,26 @@ public final class TTSManager: NSObject, ObservableObject {
     /// 重新朗读上一条成功提交的文本，便于在播放结束后快速重试
     public func replayLastRequest() {
         guard let request = lastReplayRequest else { return }
-        speak(request.text, messageID: request.messageID, flush: true)
+        if AppConfigStore.shared.ttsCacheNetworkAudioForReplay {
+            pendingReplayChunkTexts = lastNetworkChunkTexts
+            pendingReplayAudioClips = lastNetworkAudioClips
+        }
+        speak(
+            request.text,
+            messageID: request.messageID,
+            flush: true,
+            playbackModeOverride: request.playbackModeOverride,
+            serviceOverride: request.serviceOverride
+        )
+    }
+
+    public func preview(_ text: String, using service: TTSServiceConfiguration) {
+        speak(
+            text,
+            flush: true,
+            playbackModeOverride: .cloud,
+            serviceOverride: service.normalized
+        )
     }
 
     public func pause() {
@@ -177,7 +274,8 @@ public final class TTSManager: NSObject, ObservableObject {
             playbackState.status = .paused
 #endif
         case .none:
-            break
+            // 文本仍在后台预处理时也要显示暂停状态，才能让用户继续朗读。
+            playbackState.status = .paused
         }
 #endif
     }
@@ -196,12 +294,15 @@ public final class TTSManager: NSObject, ObservableObject {
             playbackState.status = .playing
 #endif
         case .none:
-            break
+            playbackState.status = .buffering
         }
 #endif
     }
 
     public func stop() {
+        preparationGeneration &+= 1
+        preparationTask?.cancel()
+        preparationTask = nil
         workerGeneration &+= 1
         workerTask?.cancel()
         workerTask = nil
@@ -209,6 +310,9 @@ public final class TTSManager: NSObject, ObservableObject {
         deactivateTTSAudioSessionIfNeeded()
         clearPrefetchState()
         queue = []
+        activeNetworkItemIDs = []
+        activeNetworkItemTexts = [:]
+        activeNetworkClips = [:]
         isSpeaking = false
         currentSpeakingMessageID = nil
         playbackState = .init(speed: settingsStore.playbackSpeed)
@@ -246,3 +350,8 @@ public final class TTSManager: NSObject, ObservableObject {
     }
 
 }
+
+#if os(iOS) || os(watchOS)
+// 语音代理继承 Sendable；在类型定义文件声明一致性，让编译器检查主线程隔离。
+extension TTSManager: AVSpeechSynthesizerDelegate {}
+#endif

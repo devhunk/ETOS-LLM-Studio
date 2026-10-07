@@ -124,6 +124,13 @@ public extension Persistence {
         }
     }
 
+    internal static func makeLocalAgentWorkspaceSizeWriter()
+        -> (@Sendable (LocalAgentWorkspace, UInt64) throws -> Void)? {
+        grdbStoreLock.withLock {
+            cachedGRDBStore?.makeLocalAgentWorkspaceSizeWriter()
+        }
+    }
+
     @discardableResult
     static func deleteLocalAgentWorkspace(id: UUID) -> Bool {
         do {
@@ -293,6 +300,18 @@ public extension Persistence {
 
     static func loadLocalLinuxMounts() -> [LocalLinuxMountRecord] {
         (try? activeAuxiliaryStore(kind: .config)?.loadLocalLinuxMounts()) ?? []
+    }
+
+    @discardableResult
+    static func updateLocalLinuxMountAuthorizationState(id: UUID, state: LocalLinuxMountAuthorizationState) -> Bool {
+        do {
+            guard let store = activeAuxiliaryStore(kind: .config) else { return false }
+            try store.updateLocalLinuxMountAuthorizationState(id: id, state: state)
+            return true
+        } catch {
+            logger.error("更新 Linux 挂载授权状态失败：\(error.localizedDescription)")
+            return false
+        }
     }
 
     @discardableResult

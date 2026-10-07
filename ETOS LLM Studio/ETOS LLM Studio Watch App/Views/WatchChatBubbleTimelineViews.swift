@@ -201,7 +201,7 @@ struct WatchReasoningMarkdownContentView: View {
     let enableMathRendering: Bool
     let textColor: Color
     let customTextStyleColors: ChatAppearanceTextStyleColors
-    let font: Font
+    let font: ETFont
     let onCodeBlockHeaderTap: ((String) -> Void)?
     let streamingMarkdownState: ETStreamingMarkdownRenderState?
     let isStreaming: Bool
@@ -386,8 +386,9 @@ struct WatchTimelineReasoningStepView: View {
             return thinkingTitle
         }
 
+        let elapsedSeconds = reasoningElapsedSeconds(referenceDate: referenceDate)
         let baseTitle: String
-        if let elapsedSeconds = reasoningElapsedSeconds(referenceDate: referenceDate) {
+        if let elapsedSeconds {
             baseTitle = String(format: NSLocalizedString("已经思考%d秒", comment: ""), elapsedSeconds)
         } else {
             baseTitle = NSLocalizedString("思考过程", comment: "")
@@ -396,6 +397,9 @@ struct WatchTimelineReasoningStepView: View {
         guard let reasoningSummary,
               !reasoningSummary.isEmpty else {
             return baseTitle
+        }
+        if let elapsedSeconds {
+            return String(format: NSLocalizedString("%ds: %@", value: "%ds: %@", comment: "思考耗时与摘要的紧凑标题"), elapsedSeconds, reasoningSummary)
         }
         return String(format: NSLocalizedString("%@：%@", comment: ""), baseTitle, reasoningSummary)
     }
@@ -424,6 +428,7 @@ struct WatchTimelineReasoningStepView: View {
 
 struct WatchTimelineToolCallStepContent: View {
     let label: String
+    let displayTitle: String?
     let statusTitle: String
     let statusIconName: String
     let statusColor: Color
@@ -431,7 +436,11 @@ struct WatchTimelineToolCallStepContent: View {
     let customTextColor: Color?
 
     private var titleText: String {
-        "\(NSLocalizedString("调用工具", comment: "Tool call timeline title"))：\(label)"
+        displayTitle ?? String(
+            format: NSLocalizedString("%@：%@", comment: ""),
+            NSLocalizedString("调用工具", comment: "Tool call timeline title"),
+            label
+        )
     }
 
     var body: some View {

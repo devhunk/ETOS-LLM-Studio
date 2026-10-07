@@ -15,9 +15,16 @@ struct MCPConfigurationTransferWatchView: View {
 
     var body: some View {
         List {
+            Section {
+                SettingsHelpCard(
+                    title: NSLocalizedString("MCP 迁移", comment: "MCP 迁移说明标题"),
+                    summary: NSLocalizedString("用 JSON 文件迁移 MCP 服务器配置。", comment: "MCP 迁移说明摘要"),
+                    details: NSLocalizedString("可通过 iPhone 键盘粘贴配置。不会自动安装本地命令或依赖；导出会移除敏感字段。", comment: "手表 MCP 迁移使用说明")
+                )
+            }
             Section(
                 header: Text(NSLocalizedString("mcpServers JSON", comment: "Watch MCP JSON section")),
-                footer: Text(NSLocalizedString("可通过 iPhone 键盘粘贴配置。不会自动安装本地命令或依赖；导出会移除敏感字段。", comment: "Watch MCP JSON footer"))
+                footer: Text(NSLocalizedString("可通过 iPhone 键盘粘贴配置。", comment: "手表 MCP 迁移页脚"))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             ) {
@@ -69,6 +76,30 @@ struct MCPConfigurationTransferWatchView: View {
         } message: {
             Text(message ?? "")
         }
+        .guideSettingsPageContext(
+            id: "watch-mcp-configuration-transfer",
+            title: NSLocalizedString("MCP 迁移", comment: "手表 MCP 配置迁移向导上下文标题"),
+            documents: [GuideDocumentReference(id: "mcp-tools", title: "MCP Toolbox")],
+            settings: [
+                .writeOnlyString(
+                    "mcp_servers_json_draft",
+                    label: NSLocalizedString("mcpServers JSON 草稿", comment: "手表 MCP 配置迁移向导字段"),
+                    isConfigured: { document != "{\n  \"mcpServers\": {}\n}" },
+                    set: { document = $0 }
+                ),
+                .readOnly(
+                    "configured_server_count",
+                    label: NSLocalizedString("已配置服务器数量", comment: "手表 MCP 配置迁移向导字段"),
+                    value: { .int(manager.servers.count) }
+                ),
+                .readOnly(
+                    "import_requires_user_action",
+                    label: NSLocalizedString("需要手动确认导入", comment: "手表 MCP 配置迁移向导字段"),
+                    value: { .bool(true) }
+                )
+            ]
+        )
+        .watchGuideEntry()
     }
 
     private func importDocument() {

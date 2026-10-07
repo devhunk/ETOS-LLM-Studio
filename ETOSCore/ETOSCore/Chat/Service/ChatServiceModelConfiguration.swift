@@ -46,15 +46,6 @@ extension ChatService {
         return candidates
     }
 
-    public var activatedTTSModels: [RunnableModel] {
-        // TTS 不再要求模型承担独立类型，保留旧能力标记的优先级以兼容已有配置。
-        let configuredModels = configuredRunnableModels
-        let ttsCapable = configuredModels.filter { $0.model.supportsTextToSpeech }
-        return ttsCapable.isEmpty
-            ? configuredModels.filter { $0.model.isChatModel }
-            : ttsCapable
-    }
-
     public var activatedOCRModels: [RunnableModel] {
         activatedChatModels.filter { $0.model.supportsVisionInput }
     }
@@ -78,15 +69,6 @@ extension ChatService {
             return match
         }
         return activatedSpeechModels.first
-    }
-
-    public func resolveSelectedTTSModel() -> RunnableModel? {
-        let storedIdentifier = Persistence.readAppConfigText(key: AppConfigKey.ttsModelIdentifier.rawValue) ?? ""
-        if !storedIdentifier.isEmpty,
-           let match = activatedTTSModels.first(where: { $0.id == storedIdentifier }) {
-            return match
-        }
-        return activatedTTSModels.first
     }
 
     func orderedRunnableModels(from models: [RunnableModel]) -> [RunnableModel] {

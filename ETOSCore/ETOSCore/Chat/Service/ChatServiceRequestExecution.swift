@@ -66,7 +66,8 @@ extension ChatService {
         enableResponseSpeedMetrics: Bool,
         currentAudioAttachment: AudioAttachment?,
         currentImageAttachments: [ImageAttachment],
-        currentFileAttachments: [FileAttachment]
+        currentFileAttachments: [FileAttachment],
+        assistantPrefill: ChatMessage? = nil
     ) async {
         let currentSessionSnapshot = currentSessionSubject.value
         let sessionForRequest = currentSessionSnapshot?.id == currentSessionID
@@ -97,15 +98,63 @@ extension ChatService {
             loadingMessageID: loadingMessageID,
             session: sessionForRequest
         )
+        let sessionPreferredModel = sessionForRequest?.preferredModelIdentifier.flatMap { identifier in
+            activatedConversationModels.first(where: { $0.id == identifier })
+        }
+        let runConfiguredModelIdentifier = conversationRunIDs(for: currentSessionID).flatMap { runIDs in
+            Persistence.loadConversationRun(id: runIDs.runID)?.requestConfiguration.modelIdentifier
+        }
+        let runConfiguredModel = runConfiguredModelIdentifier.flatMap { identifier in
+            activatedConversationModels.first(where: { $0.id == identifier })
+                ?? selectedModelSubject.value.flatMap { $0.id == identifier ? $0 : nil }
+        }
+        if runConfiguredModelIdentifier != nil, runConfiguredModel == nil {
+            addErrorMessage(
+                NSLocalizedString("错误: 没有选中的可用模型。请在设置中激活一个模型。", comment: "No active model error"),
+                sessionID: currentSessionID
+            )
+            emitSessionRequestStatus(.error, sessionID: currentSessionID)
+            return
+        }
+        guard let runnableModel = runConfiguredModel ?? sessionPreferredModel ?? selectedModelSubject.value else {
+            addErrorMessage(
+                NSLocalizedString("错误: 没有选中的可用模型。请在设置中激活一个模型。", comment: "No active model error"),
+                sessionID: currentSessionID
+            )
+            emitSessionRequestStatus(.error, sessionID: currentSessionID)
+            return
+        }
+
+        let usesRainbowThinkingSweep = await prepareThinkingSweepAppearance(
+            for: runnableModel, messageID: loadingMessageID, sessionID: currentSessionID
+        )
+
+        // 先按实际模型展开发送副本，并保护字面宏，再交给角色与脚本模板处理。
+        let requestStartedAt = Date()
+        let promptMacroRequest = await PromptMacroRenderer.render(
+            PromptMacroTemplates(
+                global: sessionForRequest?.isGlobalSystemPromptIsolationActive == true ? nil : systemPrompt,
+                conversation: sessionForRequest?.systemPrompt,
+                topic: sessionForRequest?.topicPrompt,
+                enhanced: resolvedEnhancedPrompt
+            ),
+            model: runnableModel,
+            sessionID: currentSessionID,
+            session: sessionForRequest,
+            messages: preparedRequestMessages,
+            now: requestStartedAt,
+            roleplayStore: roleplayStore
+        )
+        let promptTemplates = promptMacroRequest.templates
         var resolvedRoleplay = RoleplayRuntime.resolve(
             sessionID: currentSessionID,
-            messages: preparedRequestMessages,
+            messages: promptMacroRequest.messages,
             store: roleplayStore
         )
-        var requestMessages = preparedRequestMessages
+        var requestMessages = promptMacroRequest.messages
         if var resolved = resolvedRoleplay {
             requestMessages = RoleplayRuntime.transformedRequestMessages(
-                preparedRequestMessages,
+                promptMacroRequest.messages,
                 resolved: &resolved
             )
             if resolved.variables != roleplayStore.variableSnapshot(sessionID: currentSessionID) {
@@ -135,7 +184,12 @@ extension ChatService {
             if topK == 0 {
                 memories = await self.memoryManager.getActiveMemories()
             } else {
-                let queryText = buildMemoryQueryContext(from: requestMessages, fallbackUserMessage: userMessage)
+                // 检索使用可读文本，字面宏的临时保护标记只留在模板处理链路内。
+                let messagesBeforeMemoryQuery = requestMessages
+                let memoryQueryMessages = await Task.detached(priority: .userInitiated) {
+                    promptMacroRequest.restoringLiterals(in: messagesBeforeMemoryQuery)
+                }.value
+                let queryText = buildMemoryQueryContext(from: memoryQueryMessages, fallbackUserMessage: userMessage)
                 let queryImages = await memoryQueryImageAttachments(
                     currentImages: currentImageAttachments,
                     currentFiles: currentFileAttachments
@@ -153,8 +207,8 @@ extension ChatService {
             }
         }
 
-        let isWorldbookIsolationActive = sessionForRequest?.isWorldbookContextIsolationActive ?? false
-        let conversationMemoryEnabled = enableMemory && isConversationMemoryEnabled() && !isWorldbookIsolationActive
+        let isMemoryIsolationActive = sessionForRequest?.isMemoryContextIsolationActive ?? false
+        let conversationMemoryEnabled = enableMemory && isConversationMemoryEnabled() && !isMemoryIsolationActive
         let recentConversationSummaries: [ConversationSessionSummary]
         let conversationUserProfile: ConversationUserProfile?
         if conversationMemoryEnabled {
@@ -169,39 +223,11 @@ extension ChatService {
             conversationUserProfile = nil
         }
 
-        let sessionPreferredModel = sessionForRequest?.preferredModelIdentifier.flatMap { identifier in
-            activatedConversationModels.first(where: { $0.id == identifier })
-        }
-        let runConfiguredModelIdentifier = conversationRunIDs(for: currentSessionID).flatMap { runIDs in
-            Persistence.loadConversationRun(id: runIDs.runID)?.requestConfiguration.modelIdentifier
-        }
-        let runConfiguredModel = runConfiguredModelIdentifier.flatMap { identifier in
-            activatedConversationModels.first(where: { $0.id == identifier })
-                ?? selectedModelSubject.value.flatMap { $0.id == identifier ? $0 : nil }
-        }
-        if runConfiguredModelIdentifier != nil, runConfiguredModel == nil {
-            addErrorMessage(
-                NSLocalizedString("错误: 没有选中的可用模型。请在设置中激活一个模型。", comment: "No active model error"),
-                sessionID: currentSessionID
-            )
-            emitSessionRequestStatus(.error, sessionID: currentSessionID)
-            return
-        }
-        guard let runnableModel = runConfiguredModel ?? sessionPreferredModel ?? selectedModelSubject.value else {
-            addErrorMessage(
-                NSLocalizedString("错误: 没有选中的可用模型。请在设置中激活一个模型。", comment: "No active model error"),
-                sessionID: currentSessionID
-            )
-            emitSessionRequestStatus(.error, sessionID: currentSessionID)
-            return
-        }
-
         let effectiveStreaming = resolvedRequestStreamingEnabled(
             preference: enableStreaming,
             overrides: runnableModel.effectiveOverrideParameters
         )
 
-        let requestStartedAt = Date()
         let modelReference = MessageModelReference(
             providerID: runnableModel.provider.id,
             providerName: runnableModel.provider.name,
@@ -249,13 +275,22 @@ extension ChatService {
             regexRules: resolvedRoleplay?.regexRules ?? [],
             macroContext: &promptTemplateMacroContext
         )
+        let messagesForWorldbookScan = requestMessages
+        // 关键词扫描复用本轮提示词宏快照；只还原扫描副本，后续模板链路仍保留字面宏保护。
+        let worldbookScanInput = await Task.detached(priority: .userInitiated) {
+            (
+                messages: promptMacroRequest.restoringLiterals(in: messagesForWorldbookScan),
+                topic: promptTemplates.topic.map { promptMacroRequest.restoringLiterals(in: $0) },
+                enhanced: promptTemplates.enhanced.map { promptMacroRequest.restoringLiterals(in: $0) }
+            )
+        }.value
         var worldbookResult = await worldbookEngine.evaluateAsync(
             .init(
                 sessionID: currentSessionID,
                 worldbooks: boundWorldbooks,
-                messages: requestMessages,
-                topicPrompt: sessionForRequest?.topicPrompt,
-                enhancedPrompt: resolvedEnhancedPrompt,
+                messages: worldbookScanInput.messages,
+                topicPrompt: worldbookScanInput.topic,
+                enhancedPrompt: worldbookScanInput.enhanced,
                 personaDescription: resolvedRoleplay?.persona?.description,
                 characterDescription: resolvedRoleplay?.characters.first?.description,
                 characterPersonality: resolvedRoleplay?.characters.first?.personality,
@@ -281,9 +316,9 @@ extension ChatService {
             localLinuxToolsEnabled: activeRequestIncludesLocalLinuxTools(sessionID: currentSessionID)
         )
         var finalSystemPrompt = buildFinalSystemPrompt(
-            global: systemPrompt,
-            conversationSystem: sessionForRequest?.systemPrompt,
-            topic: sessionForRequest?.topicPrompt,
+            global: promptTemplates.global,
+            conversationSystem: promptTemplates.conversation,
+            topic: promptTemplates.topic,
             includeConversationRuntime: includesConversationTools,
             linkedConversations: linkedConversations,
             memories: memories,
@@ -348,7 +383,7 @@ extension ChatService {
         let apiFormat = runnableModel.effectiveAPIFormat
 
         if let enhancedPromptMessage = makeEnhancedPromptMessage(
-            resolvedEnhancedPrompt,
+            promptTemplates.enhanced,
             apiFormat: apiFormat,
             openAIUsesSystemRole: openAIUsesSystemRole
         ) {
@@ -384,6 +419,10 @@ extension ChatService {
                 outlets: worldbookOutlets
             )
         }
+        let messagesBeforeLiteralRestoration = messagesToSend
+        messagesToSend = await Task.detached(priority: .userInitiated) {
+            promptMacroRequest.restoringLiterals(in: messagesBeforeLiteralRestoration)
+        }.value
 
         // 续聊上下文是已持久化的固定交接，不参与角色模板、正则和宏替换。
         // 将它放在首个系统提示词之后，也确保 maxChatHistory 永远不会裁掉这段上下文。
@@ -543,6 +582,14 @@ extension ChatService {
             }
         }
 
+        // 预填充必须位于所有尾部提示之后，且保留原文边界，不经过宏或正则再次改写。
+        if let assistantPrefill {
+            messagesToSend.append(ChatMessage(
+                id: assistantPrefill.id, role: .assistant, content: assistantPrefill.content,
+                reasoningContent: assistantPrefill.reasoningContent
+            ))
+        }
+
         if LocalModelProviderBridge.isLocalRunnableModel(runnableModel) {
             let localTools = runnableModel.model.supportsToolCalling ? tools : nil
             if tools != nil, localTools == nil {
@@ -645,11 +692,18 @@ extension ChatService {
         let temperatureEnabled = await MainActor.run { AppConfigStore.shared.aiTemperatureEnabled }
         let topPEnabled = await MainActor.run { AppConfigStore.shared.aiTopPEnabled }
         var commonPayload: [String: Any] = ["stream": effectiveStreaming]
+        if let assistantPrefill {
+            commonPayload[OpenAIAdapter.responsesForceFullInputControlKey] = true
+            commonPayload[OpenAIAdapter.assistantPrefillMessageIDControlKey] = assistantPrefill.id.uuidString
+        }
         if temperatureEnabled { commonPayload["temperature"] = aiTemperature }
         if topPEnabled { commonPayload["top_p"] = aiTopP }
         commonPayload[ReasoningContentEchoPayload.key] = await openAIReasoningContentEchoModeControlValue()
         if let selectedGeminiAPIKey {
             commonPayload[GeminiAdapter.apiKeyControlKey] = selectedGeminiAPIKey
+        } else if let apiKey = runnableModel.provider.nextAPIKey() {
+            // 首次构建、Responses 回退和续写重建属于同一尝试，只消费一次轮换。
+            commonPayload[providerAPIKeyControlKey] = apiKey
         }
         if adapter is OpenAIAdapter {
             let includeUsageInStream = await MainActor.run { AppConfigStore.shared.enableOpenAIStreamIncludeUsage }
@@ -714,15 +768,6 @@ extension ChatService {
             )
             return
         }
-        RequestTransactionLogRegistry.bindRequest(
-            request,
-            requestID: requestLogContext.requestID,
-            requestedAt: requestLogContext.requestedAt,
-            providerName: requestLogContext.providerName,
-            modelID: requestLogContext.modelID,
-            isStreaming: requestLogContext.isStreaming
-        )
-
         await persistSentSystemPromptSnapshot(
             from: messagesToSend,
             loadingMessageID: loadingMessageID,
@@ -744,59 +789,109 @@ extension ChatService {
             )
         }()
 
-        if effectiveStreaming {
-            await handleStreamedResponse(
-                request: request,
-                provider: runnableModel.provider,
-                adapter: adapter,
-                loadingMessageID: loadingMessageID,
-                currentSessionID: currentSessionID,
-                userMessage: userMessage,
-                wasTemporarySession: wasTemporarySession,
-                aiTemperature: aiTemperature,
-                aiTopP: aiTopP,
-                systemPrompt: systemPrompt,
-                maxChatHistory: maxChatHistory,
-                availableTools: effectiveTools,
-                enableMemory: enableMemory,
-                enableMemoryWrite: enableMemoryWrite,
-                enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
-                includeSystemTime: includeSystemTime,
-                systemTimeInjectionPosition: systemTimeInjectionPosition,
-                enablePeriodicTimeLandmark: enablePeriodicTimeLandmark,
-                periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
-                enableResponseSpeedMetrics: enableResponseSpeedMetrics,
-                requestStartedAt: requestStartedAt,
-                requestLogContext: requestLogContext,
-                responsesFullInputFallbackRequest: responsesFullInputFallbackRequest
+        // 恢复时沿用已完成的脚本和工具；仅续写前缀及换 Key 后的视频引用需要更新。
+        let messagesBeforePrefill = assistantPrefill == nil ? messagesToSend : Array(messagesToSend.dropLast())
+        await withAutomaticRequestRetries(
+            request: request, provider: runnableModel.provider,
+            apiFormat: runnableModel.effectiveAPIFormat, loadingMessageID: loadingMessageID,
+            sessionID: currentSessionID, requestLogContext: requestLogContext,
+            initialPrefill: assistantPrefill,
+            rebuildRequest: { prefix in
+                var recoveryPayload = commonPayload
+                recoveryPayload[OpenAIAdapter.responsesForceFullInputControlKey] = true
+                recoveryPayload[OpenAIAdapter.assistantPrefillMessageIDControlKey] = prefix.id.uuidString
+                return adapter.buildChatRequest(
+                    for: runnableModel, commonPayload: recoveryPayload,
+                    messages: messagesBeforePrefill + [ChatMessage(
+                        id: prefix.id, role: .assistant, content: prefix.content,
+                        reasoningContent: prefix.reasoningContent
+                    )],
+                    tools: effectiveTools, audioAttachments: audioAttachments,
+                    imageAttachments: imageAttachments, fileAttachments: fileAttachments
+                )
+            },
+            prepareKeyRetryRequest: { retryRequest in
+                guard let previousKey = selectedGeminiAPIKey,
+                      let geminiAdapter = adapter as? GeminiAdapter,
+                      let nextKey = retryRequest.value(forHTTPHeaderField: "x-goog-api-key"),
+                      nextKey != previousKey else { return retryRequest }
+                // Files API 的文件归属随凭据变化；切换 Key 后复用该 Key 的缓存或重新上传。
+                let preparation = try await self.prepareGeminiNativeVideoAttachments(
+                    fileAttachments, provider: runnableModel.provider,
+                    adapter: geminiAdapter, selectedAPIKey: nextKey
+                )
+                let updated = try GeminiVideoRequestRebinding.replacingFileReferences(
+                    in: retryRequest, previous: fileAttachments, updated: preparation.attachments
+                )
+                fileAttachments = preparation.attachments
+                selectedGeminiAPIKey = nextKey
+                return updated
+            }
+        ) { attemptRequest, attemptLoadingID, attemptLogContext, retryHandler in
+            // 自动续写可能创建新占位，仍沿用这次请求的档位快照。
+            setMessageThinkingSweep(
+                usesRainbow: usesRainbowThinkingSweep, messageID: attemptLoadingID, sessionID: currentSessionID
             )
-        } else {
-            await handleStandardResponse(
-                request: request,
-                provider: runnableModel.provider,
-                adapter: adapter,
-                loadingMessageID: loadingMessageID,
-                currentSessionID: currentSessionID,
-                userMessage: userMessage,
-                wasTemporarySession: wasTemporarySession,
-                availableTools: effectiveTools,
-                aiTemperature: aiTemperature,
-                aiTopP: aiTopP,
-                systemPrompt: systemPrompt,
-                maxChatHistory: maxChatHistory,
-                enableMemory: enableMemory,
-                enableMemoryWrite: enableMemoryWrite,
-                enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
-                includeSystemTime: includeSystemTime,
-                systemTimeInjectionPosition: systemTimeInjectionPosition,
-                enablePeriodicTimeLandmark: enablePeriodicTimeLandmark,
-                periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
-                enableResponseSpeedMetrics: enableResponseSpeedMetrics,
-                requestStartedAt: requestStartedAt,
-                requestLogContext: requestLogContext,
-                messagesBeforeResponse: messagesToSend,
-                responsesFullInputFallbackRequest: responsesFullInputFallbackRequest
-            )
+            let fallbackRequest = self.openAIResponsesRequestUsesPreviousResponseID(attemptRequest)
+                ? responsesFullInputFallbackRequest.map {
+                    runnableModel.provider.preservingAuthentication(from: attemptRequest, in: $0)
+                } : nil
+            if effectiveStreaming {
+                await handleStreamedResponse(
+                    request: attemptRequest,
+                    provider: runnableModel.provider,
+                    adapter: adapter,
+                    loadingMessageID: attemptLoadingID,
+                    currentSessionID: currentSessionID,
+                    userMessage: userMessage,
+                    wasTemporarySession: wasTemporarySession,
+                    aiTemperature: aiTemperature,
+                    aiTopP: aiTopP,
+                    systemPrompt: systemPrompt,
+                    maxChatHistory: maxChatHistory,
+                    availableTools: effectiveTools,
+                    enableMemory: enableMemory,
+                    enableMemoryWrite: enableMemoryWrite,
+                    enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
+                    includeSystemTime: includeSystemTime,
+                    systemTimeInjectionPosition: systemTimeInjectionPosition,
+                    enablePeriodicTimeLandmark: enablePeriodicTimeLandmark,
+                    periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
+                    enableResponseSpeedMetrics: enableResponseSpeedMetrics,
+                    requestStartedAt: attemptLogContext.requestedAt,
+                    requestLogContext: attemptLogContext,
+                    responsesFullInputFallbackRequest: fallbackRequest,
+                    retryHandler: retryHandler
+                )
+            } else {
+                await handleStandardResponse(
+                    request: attemptRequest,
+                    provider: runnableModel.provider,
+                    adapter: adapter,
+                    loadingMessageID: attemptLoadingID,
+                    currentSessionID: currentSessionID,
+                    userMessage: userMessage,
+                    wasTemporarySession: wasTemporarySession,
+                    availableTools: effectiveTools,
+                    aiTemperature: aiTemperature,
+                    aiTopP: aiTopP,
+                    systemPrompt: systemPrompt,
+                    maxChatHistory: maxChatHistory,
+                    enableMemory: enableMemory,
+                    enableMemoryWrite: enableMemoryWrite,
+                    enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
+                    includeSystemTime: includeSystemTime,
+                    systemTimeInjectionPosition: systemTimeInjectionPosition,
+                    enablePeriodicTimeLandmark: enablePeriodicTimeLandmark,
+                    periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
+                    enableResponseSpeedMetrics: enableResponseSpeedMetrics,
+                    requestStartedAt: attemptLogContext.requestedAt,
+                    requestLogContext: attemptLogContext,
+                    messagesBeforeResponse: messagesToSend,
+                    responsesFullInputFallbackRequest: fallbackRequest,
+                    retryHandler: retryHandler
+                )
+            }
         }
     }
 
