@@ -256,6 +256,10 @@ struct SettingsView: View {
                         settingsNavigationLabel("用量统计", icon: .usageAnalytics)
                     }
 
+                    NavigationLink(destination: BatchTaskListView(allowsCreation: false)) {
+                        Label(NSLocalizedString("批量任务", comment: "Batch settings entry"), systemImage: "square.stack.3d.up")
+                    }
+
                     NavigationLink(destination: ToolCenterView().environmentObject(viewModel)) {
                         settingsNavigationLabel("工具中心", icon: .toolCenter)
                     }

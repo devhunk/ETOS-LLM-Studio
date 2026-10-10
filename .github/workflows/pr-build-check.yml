@@ -25,14 +25,54 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: iOS / watchOS 编译验证
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: 显示 Xcode 版本
         run: xcodebuild -version
+
+      - name: 安装原生依赖构建工具
+        run: |
+          set -euo pipefail
+          if ! command -v cmake >/dev/null; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake
+          fi
+          sh ci_scripts/ci_post_clone.sh
+
+      - name: 计算原生依赖缓存键
+        id: native-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_key=$({
+            xcodebuild -version
+            git rev-parse HEAD:Dependencies/llama.cpp
+            git rev-parse HEAD:Dependencies/ish-multiarch
+            shasum -a 256 scripts/build-*-static-librar*.sh
+          } | shasum -a 256 | awk '{print $1}')
+          echo "key=$cache_key" >> "$GITHUB_OUTPUT"
+
+      - name: 恢复原生依赖缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            Dependencies/ish-build
+            Dependencies/llama-build
+          key: native-v1-${{ runner.os }}-${{ steps.native-cache.outputs.key }}
+
+      - name: 预构建模拟器原生依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIGURATION=Debug SDK_NAME=iphonesimulator PLATFORM_NAME=iphonesimulator ARCHS="$(uname -m)" \
+            scripts/build-native-static-libraries.sh --parallel=4
+          CONFIGURATION=Debug SDK_NAME=watchsimulator PLATFORM_NAME=watchsimulator ARCHS="$(uname -m)" \
+            scripts/build-native-static-libraries.sh --parallel=4
 
       - name: 解析依赖
         run: |
@@ -64,7 +104,24 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build | tee ci-logs/watch-build.log
 
-      - name: 上传编译日志
+      - name: 运行 Batch 核心与应用集成测试
+        shell: bash
+        run: |
+          set -euo pipefail
+          simulator_id=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; data=json.load(sys.stdin); devices=[device for runtime,items in data["devices"].items() if "iOS" in runtime for device in items if "iPhone" in device["name"]]; assert devices, "No available iPhone simulator"; print(devices[0]["udid"])')
+          env -u SDKROOT -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u OBJC_INCLUDE_PATH \
+            xcodebuild \
+            -workspace 'ETOS LLM Studio.xcworkspace' \
+            -scheme 'ETOSCore' \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -parallel-testing-enabled NO \
+            -only-testing:ETOSCoreTests/BatchServiceTests \
+            -only-testing:ETOSCoreTests/BatchAppIntegrationTests \
+            -resultBundlePath ci-logs/batch-tests.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            test | tee ci-logs/batch-tests.log
+
+      - name: 上传编译与测试日志
         if: always()
         uses: actions/upload-artifact@v4
         with:

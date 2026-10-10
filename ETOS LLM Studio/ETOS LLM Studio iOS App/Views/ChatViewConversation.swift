@@ -80,7 +80,8 @@ extension ChatView {
 
                 // Z-Index 1: 消息列表
                 ScrollViewReader { chatScrollProxy in
-                ScrollView {
+                // 分段构建视图，限制每次类型推断需要处理的修饰器链长度。
+                let scrollContent = ScrollView {
                     VStack(spacing: 0) {
                         ChatScrollMetricsObserver(
                             keepsBottomPinned: scrollCoordinator.keepsBottomPinnedBinding,
@@ -447,6 +448,8 @@ extension ChatView {
                     .frame(width: chatViewportWidth, alignment: .top)
                 }
                 .frame(width: chatViewportWidth)
+
+                let observedScrollContent = scrollContent
                 .background(ChatSendFlightLayoutAnchor(controller: sendFlightController, region: .viewport))
                 .coordinateSpace(.named(ChatMessageLayoutAudit.coordinateSpaceName))
                 .onPreferenceChange(ChatHistoryAnchorFramePreferenceKey.self) { frames in
@@ -524,6 +527,8 @@ extension ChatView {
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .scrollIndicators(.hidden)
+
+                let lifecycleScrollContent = observedScrollContent
                 .accessibilityActions {
                     if appConfig.chatTimelineNavigationEnabled {
                         if canNavigateToTimelineTop {
@@ -612,6 +617,8 @@ extension ChatView {
                         scheduleImmediateBottomSnap()
                     }
                 }
+
+                lifecycleScrollContent
                 .overlay {
                     if isComposerRequestControlsExpanded {
                         Color.clear
