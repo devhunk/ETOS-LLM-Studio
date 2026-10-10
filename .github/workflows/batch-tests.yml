@@ -1,0 +1,23 @@
+name: Batch 核心测试
+
+on:
+  pull_request:
+    paths:
+      - 'ETOSCore/ETOSCore/Batch/**'
+      - 'ETOSCore/ETOSCore/Core/JSONValue.swift'
+      - 'ETOSCore/ETOSCoreTests/BatchServiceTests.swift'
+      - 'scripts/test-batch-core.sh'
+      - '.github/workflows/batch-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  batch-core:
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: 运行实际 Batch 服务与持久化测试
+        run: bash scripts/test-batch-core.sh

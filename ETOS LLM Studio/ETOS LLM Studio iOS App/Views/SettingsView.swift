@@ -100,6 +100,11 @@ struct SettingsView: View {
             }
 
             Section(NSLocalizedString("拓展能力", comment: "设置拓展能力分组")) {
+                NavigationLink {
+                    BatchTaskListView()
+                } label: {
+                    Label(NSLocalizedString("批量任务", comment: "Batch settings entry"), systemImage: "square.stack.3d.up")
+                }
                 let speechModelBinding = Binding<RunnableModel?>(
                     get: { viewModel.selectedSpeechModel },
                     set: { viewModel.setSelectedSpeechModel($0) }
